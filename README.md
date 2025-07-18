@@ -2,7 +2,9 @@
 
 A Python-based graphical user interface (GUI) application for efficiently burning two separate subtitle tracks onto multiple video files in a single batch process.
 
-<img src="https://i.imgur.com/BNIzRVh.png" width="600">
+<p align="center">
+  <img src="https://i.imgur.com/BNIzRVh.png" width="600">
+</p>
 
 ## Core Features
 
