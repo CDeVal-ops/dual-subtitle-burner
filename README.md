@@ -2,8 +2,7 @@
 
 A Python-based graphical user interface (GUI) application for efficiently burning two separate subtitle tracks onto multiple video files in a single batch process.
 
-![Screenshot of the application UI](https://i.imgur.com/3B2pYI5.png)
-*(Note: You should replace this link with a URL to your own screenshot!)*
+![Screenshot of the application UI](https://imgur.com/a/uSCBkcW)
 
 ## Core Features
 
@@ -33,4 +32,4 @@ A Python-based graphical user interface (GUI) application for efficiently burnin
 
 Save the code as a `.py` file (e.g., `dual-subtitle-burner.py`) and run it from your terminal:
 ```powershell
-py batch_burner.py
+py dual-subtitle-burner.py
