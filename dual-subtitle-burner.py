@@ -256,9 +256,11 @@ class SubtitleMergerApp(QWidget):
                 else: subprocess.run(["open" if sys.platform == "darwin" else "xdg-open", str(self.settings_dir)], check=True)
                 logging.info(f"Opened log folder: {self.settings_dir}")
             except Exception as e: QMessageBox.critical(self, "Error", f"Could not open log folder: {e}"); logging.error(f"Failed to open log folder: {e}")
+            
     def merge_subs_for_batch(self, video_file, first_sub, second_sub):
         try:
             logging.info(f"Merging subs for {video_file.name}"); sub1_text = first_sub.read_text(encoding="utf-8", errors='ignore').splitlines(); sub2_text = second_sub.read_text(encoding="utf-8", errors='ignore').splitlines()
+            
             def parse(lines):
                 header, styles, events = [], [], []; sec = None
                 for line in lines:
@@ -268,8 +270,9 @@ class SubtitleMergerApp(QWidget):
                     elif line.startswith("["): sec = None
                     if sec == "info": header.append(line)
                     elif sec == "styles": styles.append(line)
-                    elif sec == "events" and line.startswith("Dialogue:"): events.append(line)
+                    elif sec == "events" and (line.startswith("Dialogue:") or line.startswith("Comment:")): events.append(line)
                 return header, styles, events
+
             def rename_styles(styles, align, tag, font, size):
                 mapping, out = {}, []
                 for line in styles:
@@ -277,27 +280,66 @@ class SubtitleMergerApp(QWidget):
                         parts = line.split(":", 1)[1].split(',');
                         if len(parts) < 23: parts.extend(["0"] * (23 - len(parts)))
                         old_name = parts[0].strip(); new_name = f"{old_name}_{tag}"; mapping[old_name] = new_name
-                        parts[0] = new_name; parts[1] = font; parts[2] = str(size); parts[3] = "&H00FFFFFF&"; parts[5] = "&H00000000&"; parts[6] = "&H00000000&"; parts[8] = "0"; parts[16] = "1"; parts[17] = "1"; parts[18] = align
+                        parts[0] = new_name; 
+                        parts[1] = font; 
+                        parts[2] = str(size); 
+                        parts[3] = "&H00FFFFFF&";
+                        parts[5] = "&H00000000&";
+                        parts[6] = "&H00000000&";
+                        parts[8] = "0";
+                        parts[16] = "2";
+                        parts[17] = "1";
+                        parts[18] = align
                         out.append("Style:" + ",".join(parts))
                     else: out.append(line)
                 return out, mapping
-            def map_dialogue_styles(lines, mapping):
+            
+            def clean_and_map_dialogue(lines, mapping):
                 mapped_lines = []
+                fs_pattern = re.compile(r'{\\fs\d+\.?\d*}|\\fs\d+\.?\d*')
                 for l in lines:
                     if l.startswith("Dialogue:"):
-                        parts = l.split(',', 4)
-                        if len(parts) > 3 and parts[3] in mapping: parts[3] = mapping[parts[3]]; mapped_lines.append(",".join(parts))
+                        parts = l.split(',', 9)
+                        if len(parts) == 10:
+                            style_name = parts[3].strip()
+                            text_part = parts[9]
+                            if style_name in mapping:
+                                parts[3] = mapping[style_name]
+                            parts[9] = fs_pattern.sub('', text_part)
+                            mapped_lines.append(",".join(parts))
                         else: mapped_lines.append(l)
                     else: mapped_lines.append(l)
                 return mapped_lines
-            head, styles1, events1 = parse(sub1_text); _, styles2, events2 = parse(sub2_text); s1, map1 = rename_styles(styles1, "8", "TOP", self.font, self.font_size); s2, map2 = rename_styles(styles2, "2", "BOT", self.font, self.font_size); e1 = map_dialogue_styles(events1, map1); e2 = map_dialogue_styles(events2, map2)
-            merged_header = [line for line in head if not line.startswith("Style:")];
-            if not any("PlayResX" in line for line in merged_header): merged_header.append("PlayResX: 1920")
-            if not any("PlayResY" in line for line in merged_header): merged_header.append("PlayResY: 1080")
-            merged_content = merged_header[:]; merged_content.extend(["\n[V4+ Styles]", "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding"]); merged_content.extend(s1); merged_content.extend(s2); merged_content.extend(["\n[Events]", "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text"]); merged_content.extend(e1); merged_content.extend(e2)
+
+            head, styles1, events1 = parse(sub1_text); _, styles2, events2 = parse(sub2_text)
+            s1, map1 = rename_styles(styles1, "8", "TOP", self.font, self.font_size); 
+            s2, map2 = rename_styles(styles2, "2", "BOT", self.font, self.font_size); 
+            e1 = clean_and_map_dialogue(events1, map1); 
+            e2 = clean_and_map_dialogue(events2, map2)
+            
+            merged_header = [line for line in head if not line.startswith("Style:")]
+            playresx_found = any("PlayResX" in line for line in merged_header)
+            playresy_found = any("PlayResY" in line for line in merged_header)
+
+            final_header = []
+            for line in merged_header:
+                if "PlayResX" in line and not playresx_found: continue
+                if "PlayResY" in line and not playresy_found: continue
+                final_header.append(line)
+            
+            if not playresx_found: final_header.append("PlayResX: 1920")
+            if not playresy_found: final_header.append("PlayResY: 1080")
+
+            merged_content = final_header[:]; 
+            merged_content.extend(["\n[V4+ Styles]", "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding"]); 
+            merged_content.extend(s1); merged_content.extend(s2); 
+            merged_content.extend(["\n[Events]", "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text"]); 
+            merged_content.extend(e1); merged_content.extend(e2)
+            
             out_path = self.output_folder / f"{video_file.stem}_temp_merged.ass"; out_path.write_text("\n".join(merged_content), encoding="utf-8")
             return out_path
         except Exception as e: logging.error(f"Failed to merge subs for {video_file.name}: {e}"); return None
+
     def load_settings(self):
         if not self.settings_file.exists(): logging.warning("Settings file not found. Using defaults."); return
         try:
@@ -308,12 +350,14 @@ class SubtitleMergerApp(QWidget):
             if settings.get('last_bottom_sub_dir') and Path(settings['last_bottom_sub_dir']).exists(): self.last_bottom_sub_dir = Path(settings['last_bottom_sub_dir'])
             logging.info("Settings loaded successfully.")
         except Exception as e: logging.error(f"Error loading settings: {e}")
+
     def save_settings(self):
         settings = {'output_folder': str(self.output_folder), 'last_vid_dir': str(self.last_vid_dir), 'last_top_sub_dir': str(self.last_top_sub_dir), 'last_bottom_sub_dir': str(self.last_bottom_sub_dir)}
         try:
             with open(self.settings_file, 'w') as f: json.dump(settings, f, indent=4)
             logging.info("Settings saved successfully.")
         except Exception as e: logging.error(f"Could not save settings: {e}")
+
     def closeEvent(self, event):
         logging.info("--- Application Closing ---"); self.save_settings()
         if self.batch_worker and self.batch_worker.isRunning():
