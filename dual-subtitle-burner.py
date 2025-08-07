@@ -3,9 +3,9 @@ import os
 import subprocess
 import json
 import re
-import time
 import logging
 from pathlib import Path
+from collections import Counter
 
 try:
     import ctypes
@@ -15,361 +15,1048 @@ except ImportError:
 
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtWidgets import (
-    QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QFileDialog, QMessageBox, QGroupBox, QFormLayout, QProgressBar,
-    QListWidget, QTableWidget, QTableWidgetItem, QCheckBox, QHeaderView,
-    QTextEdit, QAbstractItemView, QComboBox
+    QApplication,
+    QWidget,
+    QVBoxLayout,
+    QHBoxLayout,
+    QLabel,
+    QPushButton,
+    QFileDialog,
+    QMessageBox,
+    QGroupBox,
+    QFormLayout,
+    QProgressBar,
+    QTableWidget,
+    QTableWidgetItem,
+    QHeaderView,
+    QTextEdit,
+    QAbstractItemView,
+    QComboBox,
+    QCheckBox,
 )
 
+# --- Constants ---
 CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
 DARK_MODE_STYLESHEET = """
     QWidget { background-color: #2b2b2b; color: #dcdcdc; font-family: Segoe UI; font-size: 9pt; }
     QGroupBox { font-weight: bold; border: 1px solid #444; border-radius: 5px; margin-top: 7px; }
     QGroupBox::title { subcontrol-origin: margin; subcontrol-position: top center; padding: 0 5px; }
     QPushButton { background-color: #555; border: 1px solid #666; padding: 5px; border-radius: 3px; min-height: 18px; }
-    QPushButton:hover { background-color: #666; border-color: #777; }
-    QPushButton:pressed { background-color: #4E4E4E; }
-    QPushButton:disabled { background-color: #333; color: #777; }
-    QListWidget, QTableWidget, QTextEdit, QComboBox { background-color: #222; border: 1px solid #444; }
-    QHeaderView::section { background-color: #444; padding: 4px; border: 1px solid #555; }
+    QPushButton:hover { background-color: #6a6a6a; }
+    QPushButton:pressed { background-color: #4a4a4a; }
+    QPushButton:disabled { background-color: #404040; color: #888; }
+    QTableWidget { border: 1px solid #444; border-radius: 3px; gridline-color: #444; }
+    QTextEdit { border: 1px solid #444; border-radius: 3px; background-color: #222; }
+    QComboBox { border: 1px solid #444; border-radius: 3px; padding: 3px; background-color: #3c3c3c; }
+    QComboBox::drop-down { border: none; }
+    QHeaderView::section { background-color: #3c3c3c; padding: 4px; border: 1px solid #555; }
     QProgressBar { border: 1px solid #444; border-radius: 3px; text-align: center; color: #dcdcdc; }
-    QProgressBar::chunk { background-color: #0078d4; }
+    QProgressBar::chunk { background-color: #007acc; border-radius: 2px; }
+    QLabel#statsLabel { font-family: Consolas, 'Courier New', monospace; background-color: #222; border: 1px solid #444; padding: 4px; border-radius: 3px; }
 """
 
-class BatchWorker(QThread):
-    job_started = pyqtSignal(int, str)
-    file_progress = pyqtSignal(int)
-    stats_update = pyqtSignal(dict)
-    job_finished = pyqtSignal(int, str, bool)
-    batch_finished = pyqtSignal(str)
 
-    def __init__(self, jobs, app_instance):
-        super().__init__(); self.jobs, self.app, self.is_cancelled = jobs, app_instance, False
-
-    def run(self):
-        for i, job in enumerate(self.jobs):
-            if self.is_cancelled: break
-            self.job_started.emit(i, job['video'].name)
-            merged_sub_path = self.app.merge_subs_for_batch(job['video'], job['top_sub'], job['bottom_sub'])
-            if not merged_sub_path:
-                self.job_finished.emit(i, "❌ Merge Failed", False); continue
-            success, message = self.burn_job(job, merged_sub_path)
-            if merged_sub_path.exists():
-                try: merged_sub_path.unlink(); logging.info(f"Cleaned up temp file: {merged_sub_path.name}")
-                except OSError as e: logging.error(f"Could not delete temp file: {e}")
-            self.job_finished.emit(i, message, success)
-        self.batch_finished.emit("⏹ Batch cancelled." if self.is_cancelled else "🎉 Batch complete!")
-
-    def burn_job(self, job, merged_sub_path):
-        try:
-            duration_cmd = ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', str(job['video'])]
-            result = subprocess.run(duration_cmd, capture_output=True, text=True, check=True, creationflags=CREATE_NO_WINDOW)
-            duration = float(result.stdout.strip())
-        except: duration = 0; logging.error("Could not get video duration.")
-        
-        _, encoder_flags = self.app.determine_encoder()
-        if not encoder_flags: return False, "No encoder found."
-        
-        output_video_file = self.app.output_folder / job['output_name']
-        subtitle_filter_path = str(merged_sub_path).replace('\\', '/').replace(':', '\\:')
-        
-        ffmpeg_command = ["ffmpeg", "-i", str(job['video']), "-sn", "-vf", f"ass='{subtitle_filter_path}'"]
-        ffmpeg_command.extend(encoder_flags); ffmpeg_command.extend(["-c:a", "copy", "-y", str(output_video_file)])
-        
-        logging.info(f"Executing FFmpeg command: {' '.join(map(str, ffmpeg_command))}")
-        self.app.ffmpeg_process = subprocess.Popen(ffmpeg_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, errors='replace', creationflags=CREATE_NO_WINDOW)
-        
-        for line in self.app.ffmpeg_process.stderr:
-            if self.is_cancelled: self.app.ffmpeg_process.terminate(); break
-            logging.debug(line.strip())
-            
-            if 'time=' in line and 'bitrate=' in line:
-                stats = {key.strip(): value.strip() for key, value in (pair.split('=') for pair in re.split(r'\s+', line.strip()) if '=' in pair)}
-                self.stats_update.emit(stats)
-                if duration > 0:
-                    match = re.search(r"time=(\d{2}):(\d{2}):(\d{2})\.(\d{2})", line)
-                    if match:
-                        try:
-                            h, m, s, ms = map(int, match.groups())
-                            current_time = h * 3600 + m * 60 + s + ms / 100
-                            progress = int((current_time / duration) * 100)
-                            self.file_progress.emit(progress)
-                        except ValueError: continue
-        
-        self.app.ffmpeg_process.wait()
-        if self.app.ffmpeg_process.returncode == 0 and not self.is_cancelled: return True, "Done"
-        elif self.is_cancelled: return False, "Cancelled"
-        else: return False, f"FFmpeg Error (code {self.app.ffmpeg_process.returncode})"
-
-    def stop(self): self.is_cancelled = True
-
+# --- Main Application Class ---
 class SubtitleMergerApp(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Dual Subtitle Batch Processor"); self.setGeometry(300, 100, 850, 800)
-        self.video_files, self.top_sub_files, self.bottom_sub_files = [], [], []
-        self.jobs_to_process, self.ffmpeg_process, self.batch_worker = [], None, None
-        self.font, self.font_size = "Roboto", 18
-        self.last_vid_dir, self.last_top_sub_dir, self.last_bottom_sub_dir = Path.home(), Path.home(), Path.home()
+        # --- File Paths and Settings ---
         self.output_folder = Path.home() / "Videos"
-        try:
-            self.settings_dir = Path.home() / "Documents" / "Dual Sub Burner Settings"; self.settings_dir.mkdir(exist_ok=True) 
-            self.settings_file = self.settings_dir / "settings.json"; self.setup_logging()
-        except Exception as e:
-            self.settings_file = Path(__file__).resolve().parent / "settings.json"; print(f"Could not create settings/log dir: {e}")
-        self.init_ui(); self.load_settings()
+        self.settings_dir = Path.home() / "Documents" / "Dual Sub Burner Settings"
+        self.settings_file = self.settings_dir / "settings.json"
+        self.log_file = self.settings_dir / "batch_log.txt"
 
-    def showEvent(self, event): super().showEvent(event); self._enable_dark_mode_title_bar()
-    def _enable_dark_mode_title_bar(self):
-        if sys.platform == "win32" and ctypes:
-            try:
-                hwnd = int(self.winId()); DWMWA_USE_IMMERSIVE_DARK_MODE = 20; value = wintypes.BOOL(True)
-                if ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, ctypes.byref(value), ctypes.sizeof(value)) != 0:
-                    DWMWA_USE_IMMERSIVE_DARK_MODE = 19; ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, ctypes.byref(value), ctypes.sizeof(value))
-            except Exception as e: logging.warning(f"Could not set dark title bar: {e}")
+        self.last_vid_dir = Path.home()
+        self.last_top_sub_dir = Path.home()
+        self.last_bottom_sub_dir = Path.home()
 
-    def setup_logging(self): logging.basicConfig(filename=self.settings_dir/"batch_log.txt", level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', filemode='a'); logging.info("--- Application Started ---")
-    
-    def determine_encoder(self):
-        encoders = [
-            ('NVIDIA NVENC', ['-c:v', 'h264_nvenc', '-preset', 'p5', '-cq', '23']),
-            ('AMD AMF', ['-c:v', 'h264_amf', '-preset', 'quality', '-cq', '23']),
-            ('Intel QSV', ['-c:v', 'h264_qsv', '-preset', 'medium', '-cq', '23'])
-        ]
-        logging.info("--- Starting Encoder Detection ---")
-        for name, flags in encoders:
-            encoder_name = flags[1]
-            try:
-                cmd = ['ffmpeg', '-f', 'lavfi', '-i', 'nullsrc=s=640x480', '-c:v', encoder_name, '-frames:v', '1', '-f', 'null', '-']
-                logging.info(f"Testing for encoder: {name} ({encoder_name})")
-                result = subprocess.run(cmd, capture_output=True, text=True, check=True, creationflags=CREATE_NO_WINDOW)
-                if "Cannot create a CUDA device" in result.stderr or "No NVENC capable devices found" in result.stderr:
-                    logging.warning(f"Encoder {name} known but no compatible hardware found.")
-                    continue
-                logging.info(f"Successfully detected and selected encoder: {name}")
-                return (name, flags)
-            except (subprocess.CalledProcessError, FileNotFoundError):
-                logging.warning(f"Encoder {name} not available or test failed.")
-                continue
-        
-        logging.info("No hardware encoder found. Falling back to CPU (libx264).")
-        return ('CPU (Software)', ['-c:v', 'libx264', '-preset', 'medium', '-crf', '23'])
+        # --- Data Lists ---
+        self.video_files = []
+        self.top_sub_files = []
+        self.bottom_sub_files = []
+        self.matched_files = []
+
+        # --- Processing Defaults ---
+        self.ffmpeg_path = None
+        self.ffprobe_path = None
+        self.video_codec = "libx264"
+        self.preset = "medium"
+        self.batch_worker = None
+
+        self.setup_logging()
+        self.load_settings()
+        self.init_ui()
+        self.detect_ffmpeg()
+        if self.ffmpeg_path:
+            self.detect_encoders()
+
+    def setup_logging(self):
+        self.settings_dir.mkdir(parents=True, exist_ok=True)
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s - %(levelname)s - %(message)s",
+            handlers=[
+                logging.FileHandler(self.log_file, mode="a", encoding="utf-8"),
+                logging.StreamHandler(sys.stdout),
+            ],
+        )
+        logging.info("--- Application Starting ---")
 
     def init_ui(self):
-        main_layout = QVBoxLayout()
-        selection_group = QGroupBox("1. Select File Groups"); selection_layout = QHBoxLayout(); vid_vbox = QVBoxLayout(); self.select_videos_button = QPushButton("Select Video Files"); self.select_videos_button.clicked.connect(self.select_videos); self.video_list_widget = QListWidget(); vid_vbox.addWidget(QLabel("<b>Videos</b>")); vid_vbox.addWidget(self.select_videos_button); vid_vbox.addWidget(self.video_list_widget); top_vbox = QVBoxLayout(); self.select_top_subs_button = QPushButton("Select Top Subtitle Files"); self.select_top_subs_button.clicked.connect(self.select_top_subs); self.top_sub_list_widget = QListWidget(); top_vbox.addWidget(QLabel("<b>Top Subtitles</b>")); top_vbox.addWidget(self.select_top_subs_button); top_vbox.addWidget(self.top_sub_list_widget); bottom_vbox = QVBoxLayout(); self.select_bottom_subs_button = QPushButton("Select Bottom Subtitle Files"); self.select_bottom_subs_button.clicked.connect(self.select_bottom_subs); self.bottom_sub_list_widget = QListWidget(); bottom_vbox.addWidget(QLabel("<b>Bottom Subtitles</b>")); bottom_vbox.addWidget(self.select_bottom_subs_button); bottom_vbox.addWidget(self.bottom_sub_list_widget); selection_layout.addLayout(vid_vbox); selection_layout.addLayout(top_vbox); selection_layout.addLayout(bottom_vbox); selection_group.setLayout(selection_layout)
-        matching_group = QGroupBox("2. Confirm Matched Files"); matching_layout = QVBoxLayout(); self.match_button = QPushButton("Preview Matched Files"); self.match_button.clicked.connect(self.match_and_populate_table); self.job_table = QTableWidget(); self.job_table.setSelectionBehavior(QAbstractItemView.SelectRows); self.job_table.setColumnCount(4); self.job_table.setHorizontalHeaderLabels(["Process", "Video File", "Top Subtitle", "Bottom Subtitle"]); header = self.job_table.horizontalHeader(); header.setSectionResizeMode(1, QHeaderView.Stretch); header.setSectionResizeMode(2, QHeaderView.Stretch); header.setSectionResizeMode(3, QHeaderView.Stretch); matching_layout.addWidget(self.match_button); matching_layout.addWidget(self.job_table)
-        reorder_hbox = QHBoxLayout(); self.move_up_button = QPushButton("▲ Move Up"); self.move_up_button.clicked.connect(self.move_job_up); self.move_down_button = QPushButton("▼ Move Down"); self.move_down_button.clicked.connect(self.move_job_down); reorder_hbox.addStretch(); reorder_hbox.addWidget(self.move_up_button); reorder_hbox.addWidget(self.move_down_button); matching_layout.addLayout(reorder_hbox); matching_group.setLayout(matching_layout)
-        bottom_pane_hbox = QHBoxLayout(); actions_group = QGroupBox("3. Actions & Progress"); actions_layout = QVBoxLayout(); stats_group = QGroupBox("4. Statistics & Utilities"); stats_layout = QVBoxLayout()
-        output_form = QFormLayout(); folder_hbox = QHBoxLayout(); btn_out_folder = QPushButton("Choose Output Folder"); btn_out_folder.clicked.connect(self.select_output_folder); self.output_folder_label = QLabel(str(self.output_folder)); folder_hbox.addWidget(btn_out_folder); folder_hbox.addWidget(self.output_folder_label, 1); output_form.addRow(QLabel("Output Folder:"), folder_hbox); actions_layout.addLayout(output_form)
-        progress_form = QFormLayout(); self.progress_bar = QProgressBar(); self.progress_bar.setFormat("%p%"); self.overall_progress_label = QLabel("Overall: 0/0"); progress_hbox = QHBoxLayout(); progress_hbox.addWidget(self.overall_progress_label); progress_hbox.addWidget(self.progress_bar, 1); output_form.addRow(QLabel("Current File:"), progress_hbox); actions_layout.addLayout(progress_form)
-        action_buttons_hbox = QHBoxLayout(); self.start_button = QPushButton("🔥 Start Batch"); self.start_button.clicked.connect(self.start_batch); self.cancel_button = QPushButton("❌ Cancel Batch"); self.cancel_button.clicked.connect(self.cancel_batch); self.cancel_button.setEnabled(False); action_buttons_hbox.addWidget(self.start_button); action_buttons_hbox.addWidget(self.cancel_button); action_buttons_hbox.addStretch(); actions_layout.addLayout(action_buttons_hbox); actions_group.setLayout(actions_layout)
-        stats_form = QFormLayout(); self.fps_label = QLabel("N/A"); self.bitrate_label = QLabel("N/A"); self.speed_label = QLabel("N/A"); self.frame_label = QLabel("N/A"); stats_form.addRow("FPS:", self.fps_label); stats_form.addRow("Bitrate:", self.bitrate_label); stats_form.addRow("Speed:", self.speed_label); stats_form.addRow("Frame:", self.frame_label)
-        util_buttons_hbox = QHBoxLayout(); self.clear_batch_button = QPushButton("Clear Batch List"); self.clear_batch_button.clicked.connect(self.clear_batch); btn_open_log_folder = QPushButton("📜 Open Log Folder"); btn_open_log_folder.clicked.connect(self.open_log_folder); btn_open_output_folder = QPushButton("📂 Open Output Folder"); btn_open_output_folder.clicked.connect(self.open_output_folder); util_buttons_hbox.addStretch(); util_buttons_hbox.addWidget(self.clear_batch_button); util_buttons_hbox.addWidget(btn_open_log_folder); util_buttons_hbox.addWidget(btn_open_output_folder)
-        stats_layout.addLayout(stats_form); stats_layout.addLayout(util_buttons_hbox); stats_group.setLayout(stats_layout)
-        bottom_pane_hbox.addWidget(actions_group, 2); bottom_pane_hbox.addWidget(stats_group, 1)
-        self.status = QLabel("Welcome! Select your files."); main_layout.addWidget(selection_group); main_layout.addWidget(matching_group); main_layout.addLayout(bottom_pane_hbox); main_layout.addWidget(self.status); self.setLayout(main_layout); self.update_button_states()
+        self.setWindowTitle("Dual Subtitle Batch Processor")
+        self.setGeometry(100, 100, 1300, 900)
+        self.setStyleSheet(DARK_MODE_STYLESHEET)
 
-    def select_videos(self):
-        paths, _ = QFileDialog.getOpenFileNames(self, "Select Video Files", str(self.last_vid_dir), "Video Files (*.mkv *.mp4 *.avi *.mov)");
-        if paths: self.last_vid_dir = Path(paths[0]).parent; self.video_files = sorted([Path(p) for p in paths]); self.video_list_widget.clear(); self.video_list_widget.addItems([p.name for p in self.video_files]); self.update_button_states(); logging.info(f"Selected {len(paths)} video files.")
+        main_layout = QHBoxLayout(self)
+        left_panel = QVBoxLayout()
+        right_panel = QVBoxLayout()
+
+        # --- Left Panel: File Selection ---
+        vid_box = QGroupBox("1. Select Video Files")
+        vid_layout = QHBoxLayout()
+        self.vid_list_widget = QTextEdit()
+        self.vid_list_widget.setReadOnly(True)
+        btn_vid = QPushButton("Select Videos...")
+        btn_vid.clicked.connect(self.select_video_files)
+        vid_layout.addWidget(self.vid_list_widget)
+        vid_layout.addWidget(btn_vid)
+        vid_box.setLayout(vid_layout)
+        top_sub_box = QGroupBox("2. Select Top Subtitle Files")
+        top_layout = QHBoxLayout()
+        self.top_sub_list_widget = QTextEdit()
+        self.top_sub_list_widget.setReadOnly(True)
+        btn_top = QPushButton("Select Top Subs...")
+        btn_top.clicked.connect(self.select_top_subs)
+        top_layout.addWidget(self.top_sub_list_widget)
+        top_layout.addWidget(btn_top)
+        top_sub_box.setLayout(top_layout)
+        bot_sub_box = QGroupBox("3. Select Bottom Subtitle Files")
+        bot_layout = QHBoxLayout()
+        self.bottom_sub_list_widget = QTextEdit()
+        self.bottom_sub_list_widget.setReadOnly(True)
+        btn_bot = QPushButton("Select Bottom Subs...")
+        btn_bot.clicked.connect(self.select_bottom_subs)
+        bot_layout.addWidget(self.bottom_sub_list_widget)
+        bot_layout.addWidget(btn_bot)
+        bot_sub_box.setLayout(bot_layout)
+
+        self.preview_button = QPushButton("Match & Preview Files")
+        self.preview_button.clicked.connect(self.preview_matched_files)
+
+        left_panel.addWidget(vid_box, 1)
+        left_panel.addWidget(top_sub_box, 1)
+        left_panel.addWidget(bot_sub_box, 1)
+        left_panel.addWidget(self.preview_button)
+
+        # --- Right Panel: Confirmation and Controls ---
+        confirm_box = QGroupBox("4. Confirm and Reorder Matches")
+        confirm_layout = QVBoxLayout()
+        self.confirm_table = QTableWidget()
+        self.confirm_table.setColumnCount(5)
+        self.confirm_table.setHorizontalHeaderLabels(
+            ["Process", "Video File", "Top Subtitle", "Bottom Subtitle", "Status"]
+        )
+        self.confirm_table.horizontalHeader().setSectionResizeMode(
+            1, QHeaderView.Stretch
+        )
+        self.confirm_table.horizontalHeader().setSectionResizeMode(
+            2, QHeaderView.Stretch
+        )
+        self.confirm_table.horizontalHeader().setSectionResizeMode(
+            3, QHeaderView.Stretch
+        )
+        self.confirm_table.setColumnWidth(0, 50)
+        self.confirm_table.setColumnWidth(4, 100)
+
+        reorder_layout = QHBoxLayout()
+        btn_up = QPushButton("Move Up")
+        btn_down = QPushButton("Move Down")
+        btn_clear = QPushButton("Clear Batch")
+        btn_up.clicked.connect(lambda: self.move_row(-1))
+        btn_down.clicked.connect(lambda: self.move_row(1))
+        btn_clear.clicked.connect(self.clear_batch)
+        reorder_layout.addStretch()
+        reorder_layout.addWidget(btn_clear)
+        reorder_layout.addWidget(btn_up)
+        reorder_layout.addWidget(btn_down)
+        confirm_layout.addWidget(self.confirm_table)
+        confirm_layout.addLayout(reorder_layout)
+        confirm_box.setLayout(confirm_layout)
+
+        controls_box = QGroupBox("5. Process Files")
+        controls_layout = QFormLayout()
+        output_layout = QHBoxLayout()
+        self.output_label = QLabel(str(self.output_folder))
+        btn_output = QPushButton("Select...")
+        btn_output.clicked.connect(self.select_output_folder)
+        output_layout.addWidget(self.output_label)
+        output_layout.addWidget(btn_output)
+
+        self.mode_selector = QComboBox()
+        self.mode_selector.addItems(
+            ["Soft Burn (Mux Combined Track)", "Mux Separate Tracks", "Burn (Hardsubs)"]
+        )
+        controls_layout.addRow("Output Folder:", output_layout)
+        controls_layout.addRow("Processing Mode:", self.mode_selector)
+
+        self.start_button = QPushButton("Start Batch")
+        self.start_button.clicked.connect(self.start_batch)
+        self.cancel_button = QPushButton("Cancel Batch")
+        self.cancel_button.clicked.connect(self.cancel_batch)
+        self.cancel_button.setDisabled(True)
+        controls_layout.addRow(self.start_button, self.cancel_button)
+        controls_box.setLayout(controls_layout)
+
+        # --- Right Panel: Monitoring ---
+        monitor_box = QGroupBox("Monitoring")
+        monitor_layout = QVBoxLayout()
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFormat("Current File: %p% | Overall: 0/0")
+
+        stats_grid = QHBoxLayout()
+        self.fps_label = QLabel("FPS: --")
+        self.fps_label.setObjectName("statsLabel")
+        self.speed_label = QLabel("Speed: --")
+        self.speed_label.setObjectName("statsLabel")
+        self.bitrate_label = QLabel("Bitrate: --")
+        self.bitrate_label.setObjectName("statsLabel")
+        stats_grid.addWidget(self.fps_label)
+        stats_grid.addWidget(self.speed_label)
+        stats_grid.addWidget(self.bitrate_label)
+
+        self.log_display = QTextEdit()
+        self.log_display.setReadOnly(True)
+        self.log_display.setFontFamily("Consolas")
+        self.log_display.setLineWrapMode(QTextEdit.NoWrap)
+
+        utility_layout = QHBoxLayout()
+        self.status_label = QLabel("Ready.")
+        utility_layout.addWidget(self.status_label, 1)
+        btn_open_log = QPushButton("Open Log")
+        btn_open_log.clicked.connect(self.open_log_file)
+        btn_open_folder = QPushButton("Open Output")
+        btn_open_folder.clicked.connect(self.open_output_folder)
+        utility_layout.addWidget(btn_open_log)
+        utility_layout.addWidget(btn_open_folder)
+
+        monitor_layout.addWidget(self.progress_bar)
+        monitor_layout.addLayout(stats_grid)
+        monitor_layout.addWidget(self.log_display)
+        monitor_layout.addLayout(utility_layout)
+        monitor_box.setLayout(monitor_layout)
+
+        right_panel.addWidget(confirm_box, 2)
+        right_panel.addWidget(controls_box, 0)
+        right_panel.addWidget(monitor_box, 1)
+        main_layout.addLayout(left_panel, 1)
+        main_layout.addLayout(right_panel, 3)
+
+    def select_files(self, title, initial_dir, file_filter):
+        files, _ = QFileDialog.getOpenFileNames(
+            self, title, str(initial_dir), file_filter
+        )
+        if files:
+            return [Path(f) for f in sorted(files)], Path(files[0]).parent
+        return [], initial_dir
+
+    def select_video_files(self):
+        self.video_files, self.last_vid_dir = self.select_files(
+            "Select Video Files", self.last_vid_dir, "Video Files (*.mp4 *.mkv)"
+        )
+        self.vid_list_widget.setText("\n".join(p.name for p in self.video_files))
+
     def select_top_subs(self):
-        paths, _ = QFileDialog.getOpenFileNames(self, "Select Top Subtitle Files", str(self.last_top_sub_dir), "Subtitle Files (*.ass *.srt)");
-        if paths: self.last_top_sub_dir = Path(paths[0]).parent; self.top_sub_files = sorted([Path(p) for p in paths]); self.top_sub_list_widget.clear(); self.top_sub_list_widget.addItems([p.name for p in self.top_sub_files]); self.update_button_states(); logging.info(f"Selected {len(paths)} top subtitle files.")
+        self.top_sub_files, self.last_top_sub_dir = self.select_files(
+            "Select Top Subs", self.last_top_sub_dir, "Subtitle Files (*.ass)"
+        )
+        self.top_sub_list_widget.setText("\n".join(p.name for p in self.top_sub_files))
+
     def select_bottom_subs(self):
-        paths, _ = QFileDialog.getOpenFileNames(self, "Select Bottom Subtitle Files", str(self.last_bottom_sub_dir), "Subtitle Files (*.ass *.srt)");
-        if paths: self.last_bottom_sub_dir = Path(paths[0]).parent; self.bottom_sub_files = sorted([Path(p) for p in paths]); self.bottom_sub_list_widget.clear(); self.bottom_sub_list_widget.addItems([p.name for p in self.bottom_sub_files]); self.update_button_states(); logging.info(f"Selected {len(paths)} bottom subtitle files.")
-    
-    def match_and_populate_table(self):
-        logging.info("Attempting to match file groups.")
-        if not (len(self.video_files) == len(self.top_sub_files) == len(self.bottom_sub_files)):
-            QMessageBox.warning(self, "Mismatch Error", "The number of files in each category must be the same to match them."); logging.warning("File match failed: list sizes are different."); return
-        self.job_table.setRowCount(0)
-        for i in range(len(self.video_files)): self.add_row_to_table(self.video_files[i], i)
-        self.job_table.resizeColumnsToContents(); self.update_button_states(); logging.info(f"Successfully matched {len(self.video_files)} jobs.")
-    def add_row_to_table(self, video_path, index):
-        row = self.job_table.rowCount(); self.job_table.insertRow(row); checkbox_widget = QWidget(); chk_layout = QHBoxLayout(checkbox_widget); chk_box = QCheckBox(); chk_layout.addWidget(chk_box); chk_layout.setAlignment(Qt.AlignCenter); chk_box.setChecked(True); self.job_table.setCellWidget(row, 0, checkbox_widget)
-        video_item = QTableWidgetItem(video_path.name); video_item.setData(Qt.UserRole, video_path)
-        top_combo = QComboBox(); top_combo.addItems([p.name for p in self.top_sub_files]); top_combo.setCurrentIndex(index)
-        bottom_combo = QComboBox(); bottom_combo.addItems([p.name for p in self.bottom_sub_files]); bottom_combo.setCurrentIndex(index)
-        for item in [video_item]: item.setFlags(item.flags() & ~Qt.ItemIsEditable)
-        self.job_table.setItem(row, 1, video_item); self.job_table.setCellWidget(row, 2, top_combo); self.job_table.setCellWidget(row, 3, bottom_combo)
-    def move_job_up(self):
-        row = self.job_table.currentRow();
-        if row > 0: self.swap_rows(row, row - 1); logging.info(f"Moved job up from row {row} to {row-1}.")
-    def move_job_down(self):
-        row = self.job_table.currentRow()
-        if 0 <= row < self.job_table.rowCount() - 1: self.swap_rows(row, row + 1); logging.info(f"Moved job down from row {row} to {row+1}.")
-    def swap_rows(self, source_row, dest_row):
-        for col in range(self.job_table.columnCount()):
-            if col == 0:
-                source_widget = self.job_table.cellWidget(source_row, col).layout().itemAt(0).widget(); dest_widget = self.job_table.cellWidget(dest_row, col).layout().itemAt(0).widget()
-                source_checked = source_widget.isChecked(); dest_checked = dest_widget.isChecked(); source_widget.setChecked(dest_checked); dest_widget.setChecked(source_checked)
-            elif col in [2, 3]:
-                source_widget = self.job_table.cellWidget(source_row, col); dest_widget = self.job_table.cellWidget(dest_row, col)
-                source_index = source_widget.currentIndex(); dest_index = dest_widget.currentIndex(); source_widget.setCurrentIndex(dest_index); dest_widget.setCurrentIndex(source_index)
-            else:
-                source_item = self.job_table.takeItem(source_row, col); dest_item = self.job_table.takeItem(dest_row, col); self.job_table.setItem(source_row, col, dest_item); self.job_table.setItem(dest_row, col, source_item)
-        self.job_table.selectRow(dest_row)
-    def start_batch(self):
-        self.jobs_to_process = []
-        for row in range(self.job_table.rowCount()):
-            if not self.job_table.cellWidget(row, 0).layout().itemAt(0).widget().isChecked(): continue
-            top_sub_path = self.top_sub_files[self.job_table.cellWidget(row, 2).currentIndex()]
-            bottom_sub_path = self.bottom_sub_files[self.job_table.cellWidget(row, 3).currentIndex()]
-            job = {'video': self.job_table.item(row, 1).data(Qt.UserRole), 'top_sub': top_sub_path, 'bottom_sub': bottom_sub_path, 'output_name': f"{self.job_table.item(row, 1).data(Qt.UserRole).stem}.mp4", 'table_item': self.job_table.item(row, 1)}
-            self.jobs_to_process.append(job)
-        if not self.jobs_to_process: QMessageBox.warning(self, "No Jobs", "No jobs were checked for processing."); return
-        self.start_button.setEnabled(False); self.cancel_button.setEnabled(True); self.match_button.setEnabled(False); self.clear_batch_button.setEnabled(False)
-        self.progress_bar.setValue(0); logging.info(f"--- Starting New Batch of {len(self.jobs_to_process)} jobs ---")
-        for job in self.jobs_to_process: job['table_item'].setBackground(self.palette().color(self.backgroundRole()))
-        self.batch_worker = BatchWorker(self.jobs_to_process, self); self.batch_worker.job_started.connect(self.handle_job_started); self.batch_worker.file_progress.connect(self.progress_bar.setValue); self.batch_worker.stats_update.connect(self.update_stats_display); self.batch_worker.job_finished.connect(self.handle_job_finished); self.batch_worker.batch_finished.connect(self.handle_batch_finished)
-        self.batch_worker.start()
-    def update_stats_display(self, stats): self.fps_label.setText(stats.get('fps', self.fps_label.text())); self.bitrate_label.setText(stats.get('bitrate', self.bitrate_label.text())); self.speed_label.setText(stats.get('speed', self.speed_label.text())); self.frame_label.setText(stats.get('frame', self.frame_label.text()))
-    def handle_job_started(self, job_index, video_name):
-        self.progress_bar.setValue(0); self.overall_progress_label.setText(f"Overall: {job_index + 1}/{len(self.jobs_to_process)}"); logging.info(f"--- Starting Job {job_index + 1}/{len(self.jobs_to_process)}: {video_name} ---")
-        self.status.setText(f"Processing: {video_name}")
-    def handle_job_finished(self, job_index, final_status, success):
-        item = self.jobs_to_process[job_index]['table_item']; logging.info(f"Job '{item.text()}' finished with status: {final_status}"); item.setText(final_status)
-    def handle_batch_finished(self, message):
-        self.status.setText(message); self.progress_bar.setValue(100); self.start_button.setEnabled(True); self.cancel_button.setEnabled(False); self.match_button.setEnabled(True); self.clear_batch_button.setEnabled(True); logging.info(f"--- {message} ---")
-    def cancel_batch(self):
-        logging.warning("Cancel button pressed. Terminating batch.")
-        if self.batch_worker and self.batch_worker.isRunning(): self.batch_worker.stop()
+        self.bottom_sub_files, self.last_bottom_sub_dir = self.select_files(
+            "Select Bottom Subs", self.last_bottom_sub_dir, "Subtitle Files (*.ass)"
+        )
+        self.bottom_sub_list_widget.setText(
+            "\n".join(p.name for p in self.bottom_sub_files)
+        )
+
+    def select_output_folder(self):
+        folder = QFileDialog.getExistingDirectory(
+            self, "Select Output Folder", str(self.output_folder)
+        )
+        if folder:
+            self.output_folder = Path(folder)
+            self.output_label.setText(str(self.output_folder))
+
     def clear_batch(self):
-        self.job_table.setRowCount(0); self.progress_bar.setValue(0); self.video_list_widget.clear(); self.top_sub_list_widget.clear(); self.bottom_sub_list_widget.clear(); self.video_files, self.top_sub_files, self.bottom_sub_files = [], [], []; self.status.setText("Batch cleared. Ready for next job."); logging.info("Batch list cleared by user.")
-    def update_button_states(self): all_selected = all([self.video_files, self.top_sub_files, self.bottom_sub_files]); self.match_button.setEnabled(all_selected); self.start_button.setEnabled(self.job_table.rowCount() > 0)
-    def select_output_folder(self, *args):
-        folder = QFileDialog.getExistingDirectory(self, "Select Output Folder", str(self.output_folder))
-        if folder: self.output_folder = Path(folder); self.output_folder_label.setText(str(self.output_folder)); logging.info(f"Output folder set to: {folder}")
-    def open_output_folder(self, *args):
-        if self.output_folder.exists():
+        (
+            self.video_files,
+            self.top_sub_files,
+            self.bottom_sub_files,
+            self.matched_files,
+        ) = ([], [], [], [])
+        self.vid_list_widget.clear()
+        self.top_sub_list_widget.clear()
+        self.bottom_sub_list_widget.clear()
+        self.confirm_table.setRowCount(0)
+        self.status_label.setText("Batch cleared.")
+
+    def preview_matched_files(self):
+        """
+        Intelligently matches video and subtitle files by extracting and comparing
+        their specific episode numbers. All logic is self-contained in this method.
+        """
+
+        def extract_episode_number(filename: str) -> int | None:
+            """
+            (Nested function) Extracts the episode number from a filename.
+
+            It uses a series of common patterns, ordered from most specific to
+            most general, to find the correct number.
+            """
+            # Captures numbers from formats like: S02E01, 2x01, [01], - 01.
+            patterns = [
+                r"[._ -]S\d+[Ee](\d+)",  # S02E01, S02E12
+                r"[._ -](\d+)[xX]\d+",  # 02x01, 2x12
+                r"[._ -]E(\d+)[._ -]",  # E01, E12
+                r"\[(\d{2,3})\]",  # [01], [12], [123]
+                r"-\s*(\d{2,3})\s*[\.\[]",  # - 01., - 12 [
+            ]
+
+            for pattern in patterns:
+                match = re.search(pattern, filename, re.IGNORECASE)
+                if match:
+                    try:
+                        # Return the first captured group as an integer
+                        return int(match.group(1))
+                    except (ValueError, IndexError):
+                        continue
+
+            logging.warning(
+                f"Could not extract a definitive episode number from: {filename}"
+            )
+            return None
+
+        # --- Main matching logic begins here ---
+        self.matched_files = []
+
+        # Create dictionaries mapping episode numbers to subtitle files for fast lookups.
+        top_sub_map = {extract_episode_number(f.name): f for f in self.top_sub_files}
+        bottom_sub_map = {
+            extract_episode_number(f.name): f for f in self.bottom_sub_files
+        }
+
+        # Remove None keys in case some subs couldn't be parsed
+        top_sub_map.pop(None, None)
+        bottom_sub_map.pop(None, None)
+
+        for vid_file in self.video_files:
+            match_info = {
+                "video": vid_file,
+                "top": None,
+                "bottom": None,
+                "process": True,
+            }
+
+            # Extract the unique episode number for the video using the nested function
+            episode_num = extract_episode_number(vid_file.name)
+
+            if episode_num is None:
+                logging.warning(
+                    f"Could not find an episode number for video: {vid_file.name}. Skipping match."
+                )
+                self.matched_files.append(match_info)
+                continue
+
+            # Find matches directly using the episode number as the key
+            match_info["top"] = top_sub_map.get(episode_num)
+            match_info["bottom"] = bottom_sub_map.get(episode_num)
+
+            self.matched_files.append(match_info)
+
+        # self.update_confirm_table() # Your existing UI update function
+        print(f"Processed {len(self.matched_files)} video files.")
+        for match in self.matched_files:
+            print(f"  Video: {match['video'].name}")
+            print(f"    Top Sub: {match['top'].name if match['top'] else '---'}")
+            print(
+                f"    Bottom Sub: {match['bottom'].name if match['bottom'] else '---'}\n"
+            )
+
+        self.update_confirm_table()
+
+    def update_confirm_table(self):
+        self.confirm_table.setRowCount(len(self.matched_files))
+        for row, match in enumerate(self.matched_files):
+            chk_widget = QWidget()
+            chk_layout = QHBoxLayout(chk_widget)
+            chk = QCheckBox()
+            chk.setChecked(match["process"])
+            chk_layout.addWidget(chk)
+            chk_layout.setAlignment(Qt.AlignCenter)
+            chk_widget.setLayout(chk_layout)
+            chk.stateChanged.connect(
+                lambda state, r=row: self.update_match_process(r, state)
+            )
+            self.confirm_table.setCellWidget(row, 0, chk_widget)
+
+            self.confirm_table.setCellWidget(
+                row,
+                1,
+                self.create_file_combo(self.video_files, match["video"], row, "video"),
+            )
+            self.confirm_table.setCellWidget(
+                row,
+                2,
+                self.create_file_combo(self.top_sub_files, match["top"], row, "top"),
+            )
+            self.confirm_table.setCellWidget(
+                row,
+                3,
+                self.create_file_combo(
+                    self.bottom_sub_files, match["bottom"], row, "bottom"
+                ),
+            )
+            self.confirm_table.setItem(row, 4, QTableWidgetItem("Pending"))
+        self.confirm_table.resizeRowsToContents()
+
+    def create_file_combo(self, file_list, selected_file, row, key):
+        combo = QComboBox()
+        combo.addItem("None", None)
+        for p in file_list:
+            combo.addItem(p.name, p)
+        if selected_file:
             try:
-                if sys.platform == "win32": os.startfile(self.output_folder)
-                else: subprocess.run(["open" if sys.platform == "darwin" else "xdg-open", str(self.output_folder)], check=True)
-                logging.info(f"Opened output folder: {self.output_folder}")
-            except Exception as e: QMessageBox.critical(self, "Error", f"Could not open folder: {e}"); logging.error(f"Failed to open output folder: {e}")
-    def open_log_folder(self, *args):
-        if hasattr(self, 'settings_dir') and self.settings_dir.exists():
-            try:
-                if sys.platform == "win32": os.startfile(self.settings_dir)
-                else: subprocess.run(["open" if sys.platform == "darwin" else "xdg-open", str(self.settings_dir)], check=True)
-                logging.info(f"Opened log folder: {self.settings_dir}")
-            except Exception as e: QMessageBox.critical(self, "Error", f"Could not open log folder: {e}"); logging.error(f"Failed to open log folder: {e}")
-            
-    def merge_subs_for_batch(self, video_file, first_sub, second_sub):
+                combo.setCurrentIndex(file_list.index(selected_file) + 1)
+            except ValueError:
+                pass
+        combo.currentIndexChanged.connect(
+            lambda _, r=row, k=key, c=combo: self.update_match_file(
+                r, k, c.currentData()
+            )
+        )
+        return combo
+
+    def update_match_process(self, row, state):
+        self.matched_files[row]["process"] = state == Qt.Checked
+
+    def update_match_file(self, row, key, path):
+        self.matched_files[row][key] = path
+
+    def move_row(self, direction):
+        row = self.confirm_table.currentRow()
+        if row < 0:
+            return
+        new_row = row + direction
+        if 0 <= new_row < len(self.matched_files):
+            self.matched_files.insert(new_row, self.matched_files.pop(row))
+            self.update_confirm_table()
+            self.confirm_table.selectRow(new_row)
+
+    def start_batch(self):
+        final_jobs = [
+            job
+            for job in self.matched_files
+            if job["process"] and job["video"] and job["top"] and job["bottom"]
+        ]
+        if not final_jobs:
+            QMessageBox.warning(
+                self,
+                "No Valid Jobs",
+                "Please ensure jobs are selected and all files are assigned.",
+            )
+            return
+        self.log_display.clear()
+        self.batch_worker = BatchWorker(self, final_jobs)
+        self.batch_worker.job_started.connect(self.on_job_started)
+        self.batch_worker.job_progress.connect(self.on_job_progress)
+        self.batch_worker.job_finished.connect(self.on_job_finished)
+        self.batch_worker.parsed_stats.connect(self.on_parsed_stats)
+        self.batch_worker.raw_log.connect(self.log_display.append)
+        self.batch_worker.batch_finished.connect(self.on_batch_finished)
+        self.batch_worker.start()
+
+    def cancel_batch(self):
+        if self.batch_worker and self.batch_worker.isRunning():
+            self.batch_worker.cancel()
+
+    def on_job_started(self, row_index, total_jobs, video_path):
+        self.status_label.setText(
+            f"Starting job {row_index + 1}/{total_jobs}: {video_path.name}"
+        )
+        self.confirm_table.item(row_index, 4).setText("Processing...")
+        self.progress_bar.setFormat(
+            f"Current File: %p% | Overall: {row_index + 1}/{total_jobs}"
+        )
+
+    def on_job_progress(self, percentage):
+        self.progress_bar.setValue(percentage)
+
+    def on_job_finished(self, row_index, status):
+        self.confirm_table.item(row_index, 4).setText(status)
+        self.progress_bar.setValue(100)
+
+    def on_parsed_stats(self, stats):
+        self.fps_label.setText(f"FPS: {stats.get('fps', '--')}")
+        self.speed_label.setText(f"Speed: {stats.get('speed', '--')}")
+        self.bitrate_label.setText(f"Bitrate: {stats.get('bitrate', '--')}")
+
+    def on_batch_finished(self, message):
+        self.status_label.setText(message)
+        self.progress_bar.setFormat("Complete!")
+        QMessageBox.information(self, "Complete", "Batch processing has finished.")
+
+    def open_log_file(self):
+        os.startfile(self.log_file)
+
+    def open_output_folder(self):
+        os.startfile(self.output_folder)
+
+    def detect_ffmpeg(self):
         try:
-            logging.info(f"Merging subs for {video_file.name}"); sub1_text = first_sub.read_text(encoding="utf-8", errors='ignore').splitlines(); sub2_text = second_sub.read_text(encoding="utf-8", errors='ignore').splitlines()
-            
-            def parse(lines):
-                header, styles, events = [], [], []; sec = None
-                for line in lines:
-                    if line.startswith("[Script Info]"): sec = "info"
-                    elif line.startswith("[V4+ Styles]"): sec = "styles"
-                    elif line.startswith("[Events]"): sec = "events"
-                    elif line.startswith("["): sec = None
-                    if sec == "info": header.append(line)
-                    elif sec == "styles": styles.append(line)
-                    elif sec == "events" and (line.startswith("Dialogue:") or line.startswith("Comment:")): events.append(line)
-                return header, styles, events
+            self.ffmpeg_path = "ffmpeg"
+            self.ffprobe_path = "ffprobe"
+            subprocess.run(
+                [self.ffmpeg_path, "-version"],
+                capture_output=True,
+                check=True,
+                creationflags=CREATE_NO_WINDOW,
+            )
+        except (FileNotFoundError, subprocess.CalledProcessError):
+            QMessageBox.critical(
+                self,
+                "FFmpeg/FFprobe Not Found",
+                "Please ensure FFmpeg is installed and in your system's PATH.",
+            )
+            self.ffmpeg_path = None
+            self.ffprobe_path = None
 
-            def rename_styles(styles, align, tag, font, size):
-                mapping, out = {}, []
-                for line in styles:
-                    if line.startswith("Style:"):
-                        parts = line.split(":", 1)[1].split(',');
-                        if len(parts) < 23: parts.extend(["0"] * (23 - len(parts)))
-                        old_name = parts[0].strip(); new_name = f"{old_name}_{tag}"; mapping[old_name] = new_name
-                        parts[0] = new_name; 
-                        parts[1] = font; 
-                        parts[2] = str(size); 
-                        parts[3] = "&H00FFFFFF&";
-                        parts[5] = "&H00000000&";
-                        parts[6] = "&H00000000&";
-                        parts[8] = "0";
-                        parts[16] = "2";
-                        parts[17] = "1";
-                        parts[18] = align
-                        out.append("Style:" + ",".join(parts))
-                    else: out.append(line)
-                return out, mapping
-            
-            def clean_and_map_dialogue(lines, mapping):
-                mapped_lines = []
-                fs_pattern = re.compile(r'{\\fs\d+\.?\d*}|\\fs\d+\.?\d*')
-                for l in lines:
-                    if l.startswith("Dialogue:"):
-                        parts = l.split(',', 9)
-                        if len(parts) == 10:
-                            style_name = parts[3].strip()
-                            text_part = parts[9]
-                            if style_name in mapping:
-                                parts[3] = mapping[style_name]
-                            parts[9] = fs_pattern.sub('', text_part)
-                            mapped_lines.append(",".join(parts))
-                        else: mapped_lines.append(l)
-                    else: mapped_lines.append(l)
-                return mapped_lines
+    def detect_encoders(self):
+        try:
+            result = subprocess.run(
+                [self.ffmpeg_path, "-encoders"],
+                capture_output=True,
+                text=True,
+                creationflags=CREATE_NO_WINDOW,
+            )
+            encoders = result.stdout
+            if "h264_nvenc" in encoders:
+                self.video_codec = "h264_nvenc"
+                self.preset = "p6"
+            elif "h264_amf" in encoders:
+                self.video_codec = "h264_amf"
+                self.preset = "quality"
+            elif "h264_qsv" in encoders:
+                self.video_codec = "h264_qsv"
+                self.preset = "medium"
+            else:
+                self.video_codec = "libx264"
+                self.preset = "medium"
+            logging.info(
+                f"Using detected encoder: {self.video_codec} with preset {self.preset}"
+            )
+        except Exception as e:
+            logging.error(f"Error detecting encoders: {e}")
 
-            head, styles1, events1 = parse(sub1_text); _, styles2, events2 = parse(sub2_text)
-            s1, map1 = rename_styles(styles1, "8", "TOP", self.font, self.font_size); 
-            s2, map2 = rename_styles(styles2, "2", "BOT", self.font, self.font_size); 
-            e1 = clean_and_map_dialogue(events1, map1); 
-            e2 = clean_and_map_dialogue(events2, map2)
-            
-            merged_header = [line for line in head if not line.startswith("Style:")]
-            playresx_found = any("PlayResX" in line for line in merged_header)
-            playresy_found = any("PlayResY" in line for line in merged_header)
+    def merge_subs_for_batch(self, video_file, first_sub, second_sub):
+        """
+        Performs the definitive "style unification and vertical stacking" merge.
+        This version uses a hybrid approach:
+        - Priority-based style name mapping for the top (English) subtitles.
+        - Style-name-based detection for the bottom (Chinese) subtitles, processing
+          only a specific style and merging the rest directly.
+        - Builds all styles from scratch with correct sizes and margin-based stacking.
+        """
+        try:
+            # --- NESTED HELPER FUNCTIONS (UNCHANGED) ---
+            def _parse_ass_file(sub_lines):
+                styles, events = {}, []
+                current_section = None
+                for line in sub_lines:
+                    line_strip_lower = line.strip().lower()
+                    if line_strip_lower == "[v4+ styles]":
+                        current_section = "styles"
+                    elif line_strip_lower == "[events]":
+                        current_section = "events"
+                    elif line.strip().startswith("["):
+                        current_section = None
 
-            final_header = []
-            for line in merged_header:
-                if "PlayResX" in line and not playresx_found: continue
-                if "PlayResY" in line and not playresy_found: continue
-                final_header.append(line)
-            
-            if not playresx_found: final_header.append("PlayResX: 1920")
-            if not playresy_found: final_header.append("PlayResY: 1080")
+                    if current_section == "styles" and line.lower().startswith(
+                        "style:"
+                    ):
+                        try:
+                            name = line.split(":", 1)[1].split(",")[0].strip()
+                            styles[name] = line
+                        except IndexError:
+                            logging.warning(f"Could not parse style line: {line}")
+                    elif current_section == "events" and (
+                        line.lower().startswith("dialogue:")
+                        or line.lower().startswith("comment:")
+                    ):
+                        events.append(line)
+                return styles, events
 
-            merged_content = final_header[:]; 
-            merged_content.extend(["\n[V4+ Styles]", "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding"]); 
-            merged_content.extend(s1); merged_content.extend(s2); 
-            merged_content.extend(["\n[Events]", "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text"]); 
-            merged_content.extend(e1); merged_content.extend(e2)
-            
-            out_path = self.output_folder / f"{video_file.stem}_temp_merged.ass"; out_path.write_text("\n".join(merged_content), encoding="utf-8")
+            def create_top_style_map(original_styles, events):
+                """Creates a style map for top subs based on known names and usage."""
+                style_map = {}
+                known_primary = {"Default"}
+                known_secondary = {"Italics", "On Top Italic", "On Top", "OS"}
+
+                for style_name in original_styles.keys():
+                    if style_name in known_primary:
+                        style_map[style_name] = "Top-Primary"
+                    elif style_name in known_secondary:
+                        style_map[style_name] = "Top-Secondary"
+
+                # Fallback for unknown style names based on usage
+                if not style_map:
+                    dialogue_events = [
+                        line for line in events if line.lower().startswith("dialogue:")
+                    ]
+                    if dialogue_events:
+                        style_counts = Counter(
+                            line.split(",", 9)[3].strip() for line in dialogue_events
+                        )
+                        if style_counts:
+                            primary = style_counts.most_common(1)[0][0]
+                            style_map[primary] = "Top-Primary"
+                            if len(style_counts) > 1:
+                                secondary = style_counts.most_common(2)[1][0]
+                                if primary != secondary:
+                                    style_map[secondary] = "Top-Secondary"
+                return style_map
+
+            # --- 1. PARSE BOTH FILES (UNCHANGED) ---
+            sub1_text = first_sub.read_text(
+                encoding="utf-8", errors="ignore"
+            ).splitlines()
+            sub2_text = second_sub.read_text(
+                encoding="utf-8", errors="ignore"
+            ).splitlines()
+
+            styles1, events1 = _parse_ass_file(sub1_text)
+            styles2, events2 = _parse_ass_file(sub2_text)
+
+            # --- 2. CREATE MASTER STYLES FROM SCRATCH (UNCHANGED) ---
+            final_styles = {
+                "Top-Primary": "Style: Top-Primary,Arial,52,&H00FFFFFF,&H000000FF,&H00000000,&H99000000,-1,0,0,0,100,100,0,0,1,2.5,2,8,20,20,25,1",
+                "Top-Secondary": "Style: Top-Secondary,Arial,44,&H00FFFFFF,&H000000FF,&H00000000,&H99000000,-1,-1,0,0,100,100,0,0,1,2.5,2,8,20,20,80,1",
+                "Bottom-Primary": "Style: Bottom-Primary,Arial,52,&H00FFFFFF,&H000000FF,&H00000000,&H99000000,-1,0,0,0,100,100,0,0,1,2.5,2,2,20,20,80,1",
+                "Bottom-Secondary": "Style: Bottom-Secondary,Arial,44,&H00FFFFFF,&H000000FF,&H00000000,&H99000000,-1,-1,0,0,100,100,0,0,1,2.5,2,2,20,20,25,1",
+            }
+
+            # --- 3. PROCESS AND REMAP EVENTS ---
+            final_events = []
+            tag_stripper = re.compile(r"\{\\[^\}]*?(an|pos|move|org)[^\}]*\}")
+
+            # Process Top Subtitles using the priority-based style map (Unchanged)
+            style_map1 = create_top_style_map(styles1, events1)
+            for line in events1:
+                # Process both Dialogue and Comment lines from the top sub
+                if line.lower().startswith(("dialogue:", "comment:")):
+                    try:
+                        parts = line.split(",", 9)
+                        original_style = parts[3].strip()
+                        # Use a default style if the original isn't in the map
+                        parts[3] = style_map1.get(original_style, "Top-Primary")
+                        parts[9] = tag_stripper.sub("", parts[9])
+                        final_events.append(",".join(parts))
+
+                        # Preserve any unmapped styles that aren't being replaced
+                        if (
+                            original_style not in style_map1
+                            and original_style not in final_styles
+                        ):
+                            if original_style in styles1:
+                                final_styles[original_style] = styles1[original_style]
+                    except IndexError:
+                        final_events.append(line)  # Append malformed lines as-is
+                else:
+                    final_events.append(line)
+
+            # ### MODIFIED SECTION ###
+            # Process Bottom Subtitles using style-based separation
+            for line in events2:
+                # This check now handles both Dialogue and Comment lines correctly.
+                if line.lower().startswith(("dialogue:", "comment:")):
+                    try:
+                        parts = line.split(",", 9)
+                        original_style = parts[3].strip()
+
+                        # Check if the style is the one designated for processing
+                        if original_style == "Sub-CN":
+                            # Process this line: remap style and strip tags
+                            text_field = parts[9]
+                            if text_field.strip().startswith("{\\an8}"):
+                                parts[3] = "Bottom-Secondary"
+                            else:
+                                parts[3] = "Bottom-Primary"
+
+                            parts[9] = tag_stripper.sub("", text_field)
+                            final_events.append(",".join(parts))
+                        else:
+                            # This is the "remainder". Merge it directly.
+                            # 1. Append the line without any modification.
+                            final_events.append(line)
+                            # 2. Ensure its original style definition is carried over if not already present.
+                            if (
+                                original_style not in final_styles
+                                and original_style in styles2
+                            ):
+                                final_styles[original_style] = styles2[original_style]
+                    except IndexError:
+                        # Append malformed lines as-is to preserve them
+                        final_events.append(line)
+                else:
+                    # Append non-event lines as-is (though _parse_ass_file should filter these out)
+                    final_events.append(line)
+            # ### END MODIFIED SECTION ###
+
+            # --- 4. ASSEMBLE CLEAN FILE (UNCHANGED) ---
+            clean_header = [
+                "[Script Info]",
+                "; Script generated by Dual Subtitle Burner - Final Method",
+                "Title: Merged Subtitle",
+                "ScriptType: v4.00+",
+                "WrapStyle: 0",
+                "PlayResX: 1920",
+                "PlayResY: 1080",
+                "Collisions: Normal",
+            ]
+
+            merged_content = clean_header
+            merged_content.extend(
+                [
+                    "\n[V4+ Styles]",
+                    "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
+                ]
+            )
+            merged_content.extend(sorted(final_styles.values()))
+            merged_content.extend(
+                [
+                    "\n[Events]",
+                    "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
+                ]
+            )
+            merged_content.extend(final_events)
+
+            out_path = self.settings_dir / f"{video_file.stem}_temp_merged.ass"
+            out_path.write_text("\n".join(merged_content), encoding="utf-8-sig")
+
+            logging.info(
+                f"Successfully performed final style-unification and stacking merge for {video_file.name}."
+            )
             return out_path
-        except Exception as e: logging.error(f"Failed to merge subs for {video_file.name}: {e}"); return None
+        except Exception as e:
+            logging.error(
+                f"Definitive style-unification merge failed for {video_file.name}: {e}",
+                exc_info=True,
+            )
+            return None
 
     def load_settings(self):
-        if not self.settings_file.exists(): logging.warning("Settings file not found. Using defaults."); return
         try:
-            with open(self.settings_file, 'r') as f: settings = json.load(f)
-            if settings.get('output_folder') and Path(settings['output_folder']).exists(): self.output_folder = Path(settings['output_folder']); self.output_folder_label.setText(str(self.output_folder))
-            if settings.get('last_vid_dir') and Path(settings['last_vid_dir']).exists(): self.last_vid_dir = Path(settings['last_vid_dir'])
-            if settings.get('last_top_sub_dir') and Path(settings['last_top_sub_dir']).exists(): self.last_top_sub_dir = Path(settings['last_top_sub_dir'])
-            if settings.get('last_bottom_sub_dir') and Path(settings['last_bottom_sub_dir']).exists(): self.last_bottom_sub_dir = Path(settings['last_bottom_sub_dir'])
-            logging.info("Settings loaded successfully.")
-        except Exception as e: logging.error(f"Error loading settings: {e}")
+            if not self.settings_file.exists():
+                return
+            with open(self.settings_file, "r") as f:
+                settings = json.load(f)
+            if (
+                settings.get("output_folder")
+                and Path(settings["output_folder"]).exists()
+            ):
+                self.output_folder = Path(settings["output_folder"])
+            if settings.get("last_vid_dir") and Path(settings["last_vid_dir"]).exists():
+                self.last_vid_dir = Path(settings["last_vid_dir"])
+            if (
+                settings.get("last_top_sub_dir")
+                and Path(settings["last_top_sub_dir"]).exists()
+            ):
+                self.last_top_sub_dir = Path(settings["last_top_sub_dir"])
+            if (
+                settings.get("last_bottom_sub_dir")
+                and Path(settings["last_bottom_sub_dir"]).exists()
+            ):
+                self.last_bottom_sub_dir = Path(settings["last_bottom_sub_dir"])
+            logging.info("Settings loaded.")
+        except Exception as e:
+            logging.error(f"Error loading settings: {e}")
 
     def save_settings(self):
-        settings = {'output_folder': str(self.output_folder), 'last_vid_dir': str(self.last_vid_dir), 'last_top_sub_dir': str(self.last_top_sub_dir), 'last_bottom_sub_dir': str(self.last_bottom_sub_dir)}
+        settings = {
+            "output_folder": str(self.output_folder),
+            "last_vid_dir": str(self.last_vid_dir),
+            "last_top_sub_dir": str(self.last_top_sub_dir),
+            "last_bottom_sub_dir": str(self.last_bottom_sub_dir),
+        }
         try:
-            with open(self.settings_file, 'w') as f: json.dump(settings, f, indent=4)
-            logging.info("Settings saved successfully.")
-        except Exception as e: logging.error(f"Could not save settings: {e}")
+            with open(self.settings_file, "w") as f:
+                json.dump(settings, f, indent=4)
+            logging.info("Settings saved.")
+        except Exception as e:
+            logging.error(f"Could not save settings: {e}")
 
     def closeEvent(self, event):
-        logging.info("--- Application Closing ---"); self.save_settings()
+        logging.info("--- Application Closing ---")
+        self.save_settings()
         if self.batch_worker and self.batch_worker.isRunning():
-            self.cancel_batch(); self.batch_worker.wait()
+            self.cancel_batch()
+            self.batch_worker.wait()
         event.accept()
+
+
+# --- Worker Thread Class ---
+class BatchWorker(QThread):
+    job_started = pyqtSignal(int, int, Path)
+    job_progress = pyqtSignal(int)
+    job_finished = pyqtSignal(int, str)
+    batch_finished = pyqtSignal(str)
+    parsed_stats = pyqtSignal(dict)
+    raw_log = pyqtSignal(str)
+
+    def __init__(self, app_instance, jobs):
+        super().__init__()
+        self.app = app_instance
+        self.jobs = jobs
+        self.is_cancelled = False
+        self.process = None
+
+    def cancel(self):
+        self.is_cancelled = True
+        if self.process:
+            try:
+                self.process.kill()
+            except Exception as e:
+                logging.error(f"Error killing FFmpeg process: {e}")
+
+    def get_video_duration(self, video_path):
+        try:
+            result = subprocess.run(
+                [
+                    self.app.ffprobe_path,
+                    "-v",
+                    "error",
+                    "-show_entries",
+                    "format=duration",
+                    "-of",
+                    "default=noprint_wrappers=1:nokey=1",
+                    str(video_path),
+                ],
+                capture_output=True,
+                text=True,
+                check=True,
+                creationflags=CREATE_NO_WINDOW,
+            )
+            return float(result.stdout.strip())
+        except Exception as e:
+            logging.error(f"Could not get duration for {video_path.name}: {e}")
+            return 0
+
+    def run(self):
+        self.app.start_button.setDisabled(True)
+        self.app.cancel_button.setEnabled(True)
+        total_jobs = len(self.jobs)
+
+        for i, job in enumerate(self.jobs):
+            if self.is_cancelled:
+                break
+
+            self.job_started.emit(i, total_jobs, job["video"])
+
+            duration = (
+                self.get_video_duration(job["video"])
+                if "Burn" in self.app.mode_selector.currentText()
+                else 0
+            )
+            processing_mode = self.app.mode_selector.currentText()
+            ffmpeg_command, merged_subs_path = [], None
+
+            try:
+                if "Soft Burn" in processing_mode:
+                    merged_subs_path = self.app.merge_subs_for_batch(
+                        job["video"], job["top"], job["bottom"]
+                    )
+                    if not merged_subs_path:
+                        logging.error(
+                            f"Skipping {job['video'].name} due to subtitle merging error."
+                        )
+                        self.job_finished.emit(i, "❌ Merge Failed")
+                        continue
+                    output_file = (
+                        self.app.output_folder / f"{job['video'].stem}_softburned.mkv"
+                    )
+                    ffmpeg_command = [
+                        self.app.ffmpeg_path,
+                        "-y",
+                        "-i",
+                        str(job["video"]),
+                        "-i",
+                        str(merged_subs_path),
+                        "-map",
+                        "0:v:0",
+                        "-map",
+                        "0:a?",
+                        "-map",
+                        "1",
+                        "-c",
+                        "copy",
+                        "-disposition:s:0",
+                        "default",
+                        str(output_file),
+                    ]
+
+                elif "Mux Separate" in processing_mode:
+                    output_file = (
+                        self.app.output_folder / f"{job['video'].stem}_muxed.mkv"
+                    )
+                    ffmpeg_command = [
+                        self.app.ffmpeg_path,
+                        "-y",
+                        "-i",
+                        str(job["video"]),
+                        "-i",
+                        str(job["top"]),
+                        "-i",
+                        str(job["bottom"]),
+                        "-map",
+                        "0:v:0",
+                        "-map",
+                        "0:a?",
+                        "-map",
+                        "1",
+                        "-map",
+                        "2",
+                        "-c",
+                        "copy",
+                        "-c:s",
+                        "ass",
+                        "-metadata:s:s:0",
+                        "language=eng",
+                        "-metadata:s:s:0",
+                        "title=English",
+                        "-metadata:s:s:1",
+                        "language=chi",
+                        "-metadata:s:s:1",
+                        "title=Chinese",
+                        "-disposition:s:s:0",
+                        "default",
+                        str(output_file),
+                    ]
+
+                elif "Burn" in processing_mode:
+                    merged_subs_path = self.app.merge_subs_for_batch(
+                        job["video"], job["top"], job["bottom"]
+                    )
+                    if not merged_subs_path:
+                        logging.error(
+                            f"Skipping {job['video'].name} due to subtitle merging error."
+                        )
+                        self.job_finished.emit(i, "❌ Merge Failed")
+                        continue
+                    output_file = (
+                        self.app.output_folder / f"{job['video'].stem}_burned.mp4"
+                    )
+
+                    filter_path = merged_subs_path.as_posix().replace(":", r"\:")
+                    vf_filter = f"ass='{filter_path}'"
+
+                    ffmpeg_command = [
+                        self.app.ffmpeg_path,
+                        "-y",
+                        "-i",
+                        str(job["video"]),
+                        "-vf",
+                        vf_filter,
+                        "-c:v",
+                        self.app.video_codec,
+                        "-preset",
+                        self.app.preset,
+                        "-crf",
+                        "23",
+                        "-c:a",
+                        "copy",
+                        str(output_file),
+                    ]
+
+                logging.info(f"Executing command: {' '.join(ffmpeg_command)}")
+                self.process = subprocess.Popen(
+                    ffmpeg_command,
+                    creationflags=CREATE_NO_WINDOW,
+                    stderr=subprocess.PIPE,
+                    universal_newlines=True,
+                    encoding="utf-8",
+                    errors="replace",
+                )
+
+                for line in self.process.stderr:
+                    if self.is_cancelled:
+                        break
+                    self.raw_log.emit(line.strip())
+
+                    if time_match := re.search(
+                        r"time=(\d{2}):(\d{2}):(\d{2})\.(\d{2})", line
+                    ):
+                        if duration > 0:
+                            h, m, s, ms = map(int, time_match.groups())
+                            elapsed = h * 3600 + m * 60 + s + ms / 100
+                            self.job_progress.emit(int((elapsed / duration) * 100))
+
+                    stats = {}
+                    if fps_match := re.search(r"fps=\s*([\d.]+)", line):
+                        stats["fps"] = fps_match.group(1)
+                    if speed_match := re.search(r"speed=\s*([\d.]+)x", line):
+                        stats["speed"] = speed_match.group(1) + "x"
+                    if bitrate_match := re.search(r"bitrate=\s*([\d.]+kbits/s)", line):
+                        stats["bitrate"] = bitrate_match.group(1)
+                    if stats:
+                        self.parsed_stats.emit(stats)
+
+                self.process.wait()
+                if self.is_cancelled:
+                    self.job_finished.emit(i, "Cancelled")
+                elif self.process.returncode == 0:
+                    self.job_finished.emit(i, "Done")
+                else:
+                    self.job_finished.emit(i, "❌ Failed")
+
+            except Exception as e:
+                logging.error(f"Worker thread error on job {i}: {e}", exc_info=True)
+                self.job_finished.emit(i, "❌ Error")
+            finally:
+                if merged_subs_path and merged_subs_path.exists():
+                    try:
+                        merged_subs_path.unlink()
+                    except OSError as e:
+                        logging.error(
+                            f"Error removing temp file {merged_subs_path}: {e}"
+                        )
+
+        self.batch_finished.emit(
+            "Batch processing finished."
+            if not self.is_cancelled
+            else "Batch cancelled."
+        )
+
 
 if __name__ == "__main__":
     QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
     QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
-    
     app = QApplication(sys.argv)
-    app.setStyleSheet(DARK_MODE_STYLESHEET)
-    window = SubtitleMergerApp()
-    window.show()
+    ex = SubtitleMergerApp()
+    ex.show()
+    if ctypes and sys.platform == "win32":
+        try:
+            hwnd = ex.winId()
+            value = ctypes.c_int(1)
+            # Use constant 20 for Windows 11, fallback to 19 for Windows 10
+            if (
+                ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                    hwnd, 20, ctypes.byref(value), ctypes.sizeof(value)
+                )
+                != 0
+            ):
+                ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                    hwnd, 19, ctypes.byref(value), ctypes.sizeof(value)
+                )
+        except Exception as e:
+            logging.warning(f"Could not set dark title bar: {e}")
     sys.exit(app.exec_())
