@@ -6,6 +6,7 @@ import re
 import logging
 from pathlib import Path
 from collections import Counter
+from collections import namedtuple
 
 try:
     import ctypes
@@ -563,12 +564,13 @@ class SubtitleMergerApp(QWidget):
         Performs the definitive "style unification and vertical stacking" merge.
         This version uses a hybrid approach:
         - Priority-based style name mapping for the top (English) subtitles.
-        - Style-name-based detection for the bottom (Chinese) subtitles, processing
-          only a specific style and merging the rest directly.
+        - **Corrected Logic:** Intelligently splits secondary top subtitles where they
+          overlap with the start/end of primary dialogue, ensuring smooth transitions.
+        - Style-name-based detection for the bottom (Chinese) subtitles.
         - Builds all styles from scratch with correct sizes and margin-based stacking.
         """
         try:
-            # --- NESTED HELPER FUNCTIONS (UNCHANGED) ---
+            # --- NESTED HELPER FUNCTIONS ---
             def _parse_ass_file(sub_lines):
                 styles, events = {}, []
                 current_section = None
@@ -597,133 +599,218 @@ class SubtitleMergerApp(QWidget):
                 return styles, events
 
             def create_top_style_map(original_styles, events):
-                """Creates a style map for top subs based on known names and usage."""
                 style_map = {}
                 known_primary = {"Default"}
                 known_secondary = {"Italics", "On Top Italic", "On Top", "OS"}
-
                 for style_name in original_styles.keys():
                     if style_name in known_primary:
                         style_map[style_name] = "Top-Primary"
                     elif style_name in known_secondary:
                         style_map[style_name] = "Top-Secondary"
-
-                # Fallback for unknown style names based on usage
-                if not style_map:
+                if not style_map:  # Fallback
                     dialogue_events = [
-                        line for line in events if line.lower().startswith("dialogue:")
+                        l for l in events if l.lower().startswith("dialogue:")
                     ]
                     if dialogue_events:
                         style_counts = Counter(
-                            line.split(",", 9)[3].strip() for line in dialogue_events
+                            l.split(",", 9)[3].strip() for l in dialogue_events
                         )
                         if style_counts:
                             primary = style_counts.most_common(1)[0][0]
                             style_map[primary] = "Top-Primary"
-                            if len(style_counts) > 1:
-                                secondary = style_counts.most_common(2)[1][0]
-                                if primary != secondary:
-                                    style_map[secondary] = "Top-Secondary"
+                            if (
+                                len(style_counts) > 1
+                                and primary != style_counts.most_common(2)[1][0]
+                            ):
+                                style_map[style_counts.most_common(2)[1][0]] = (
+                                    "Top-Secondary"
+                                )
                 return style_map
 
-            # --- 1. PARSE BOTH FILES (UNCHANGED) ---
+            def _ass_time_to_ms(t: str) -> int:
+                h, m, s_cs = t.split(":")
+                s, cs = s_cs.split(".")
+                return (int(h) * 3600 + int(m) * 60 + int(s)) * 1000 + int(cs) * 10
+
+            def _ms_to_ass_time(ms: int) -> str:
+                h, ms = divmod(ms, 3600000)
+                m, ms = divmod(ms, 60000)
+                s, ms = divmod(ms, 1000)
+                cs = ms // 10
+                return f"{h:01}:{m:02}:{s:02}.{cs:02}"
+
+            def _overlaps(a_start, a_end, b_start, b_end) -> bool:
+                return max(a_start, b_start) < min(a_end, b_end)
+
+            # ### NEW, CORRECTED HELPER FUNCTION ###
+            def _split_top_subs_at_primary_boundaries(events, style_map):
+                """
+                Splits secondary subtitle events based on the start/end times of
+                primary subtitle events to prevent rendering glitches with overlaps.
+                """
+                primary_events, secondary_events, other_events = [], [], []
+
+                for line in events:
+                    if not (
+                        line.lower().startswith("dialogue:")
+                        or line.lower().startswith("comment:")
+                    ):
+                        continue  # Skip non-event lines
+                    try:
+                        style_name = line.split(",", 9)[3].strip()
+                        mapped_style = style_map.get(style_name)
+                        if mapped_style == "Top-Primary":
+                            primary_events.append(line)
+                        elif mapped_style == "Top-Secondary":
+                            secondary_events.append(line)
+                        else:
+                            other_events.append(line)  # Preserve unmapped styles
+                    except IndexError:
+                        other_events.append(line)
+
+                primary_change_points = set()
+                for line in primary_events:
+                    parts = line.split(",", 9)
+                    primary_change_points.add(_ass_time_to_ms(parts[1].strip()))
+                    primary_change_points.add(_ass_time_to_ms(parts[2].strip()))
+
+                split_secondary_events = []
+                for line in secondary_events:
+                    parts = line.split(",", 9)
+                    start_ms = _ass_time_to_ms(parts[1].strip())
+                    end_ms = _ass_time_to_ms(parts[2].strip())
+
+                    split_points = {start_ms, end_ms}
+                    for point in primary_change_points:
+                        if start_ms < point < end_ms:
+                            split_points.add(point)
+
+                    if len(split_points) == 2:
+                        split_secondary_events.append(line)
+                        continue
+
+                    sorted_points = sorted(list(split_points))
+                    for i in range(len(sorted_points) - 1):
+                        new_parts = parts[:]
+                        new_parts[1] = _ms_to_ass_time(sorted_points[i])
+                        new_parts[2] = _ms_to_ass_time(sorted_points[i + 1])
+                        split_secondary_events.append(",".join(new_parts))
+
+                return primary_events + split_secondary_events + other_events
+
+            # --- 1. PARSE BOTH FILES ---
             sub1_text = first_sub.read_text(
                 encoding="utf-8", errors="ignore"
             ).splitlines()
             sub2_text = second_sub.read_text(
                 encoding="utf-8", errors="ignore"
             ).splitlines()
-
             styles1, events1 = _parse_ass_file(sub1_text)
             styles2, events2 = _parse_ass_file(sub2_text)
 
-            # --- 2. CREATE MASTER STYLES FROM SCRATCH (UNCHANGED) ---
+            # --- 2. CREATE MASTER STYLES ---
             final_styles = {
-                "Top-Primary": "Style: Top-Primary,Arial,52,&H00FFFFFF,&H000000FF,&H00000000,&H99000000,-1,0,0,0,100,100,0,0,1,2.5,2,8,20,20,25,1",
-                "Top-Secondary": "Style: Top-Secondary,Arial,44,&H00FFFFFF,&H000000FF,&H00000000,&H99000000,-1,-1,0,0,100,100,0,0,1,2.5,2,8,20,20,80,1",
-                "Bottom-Primary": "Style: Bottom-Primary,Arial,52,&H00FFFFFF,&H000000FF,&H00000000,&H99000000,-1,0,0,0,100,100,0,0,1,2.5,2,2,20,20,80,1",
-                "Bottom-Secondary": "Style: Bottom-Secondary,Arial,44,&H00FFFFFF,&H000000FF,&H00000000,&H99000000,-1,-1,0,0,100,100,0,0,1,2.5,2,2,20,20,25,1",
+                "Top-Primary": "Style: Top-Primary,Roboto,56,&H00FFFFFF,&H000000FF,&H00000000,&H99000000,-1,0,0,0,100,100,0,0,1,2.5,2,8,20,20,20,1",
+                "Top-Secondary": "Style: Top-Secondary,Roboto,48,&H00FFFFFF,&H000000FF,&H00000000,&H99000000,-1,-1,0,0,100,100,0,0,1,2.5,2,8,20,20,20,1",
+                "Bottom-Primary-Normal": "Style: Bottom-Primary-Normal,Noto Sans CJK TC,62,&H00FFFFFF,&H000000FF,&H00000000,&H99000000,-1,0,0,0,100,100,0,0,1,2.5,2,2,20,20,30,1",
+                "Bottom-Primary-Raised": "Style: Bottom-Primary-Raised,Noto Sans CJK TC,62,&H00FFFFFF,&H000000FF,&H00000000,&H99000000,-1,0,0,0,100,100,0,0,1,2.5,2,2,20,20,90,1",
+                "Bottom-Secondary": "Style: Bottom-Secondary,Noto Sans CJK TC,54,&H00FFFFFF,&H000000FF,&H00000000,&H99000000,-1,-1,0,0,100,100,0,0,1,2.5,2,2,20,20,30,1",
             }
 
             # --- 3. PROCESS AND REMAP EVENTS ---
             final_events = []
             tag_stripper = re.compile(r"\{\\[^\}]*?(an|pos|move|org)[^\}]*\}")
 
-            # Process Top Subtitles using the priority-based style map (Unchanged)
+            # ### CORRECTED TOP SUBTITLE PROCESSING ###
             style_map1 = create_top_style_map(styles1, events1)
-            for line in events1:
-                # Process both Dialogue and Comment lines from the top sub
-                if line.lower().startswith(("dialogue:", "comment:")):
-                    try:
-                        parts = line.split(",", 9)
-                        original_style = parts[3].strip()
-                        # Use a default style if the original isn't in the map
-                        parts[3] = style_map1.get(original_style, "Top-Primary")
-                        parts[9] = tag_stripper.sub("", parts[9])
-                        final_events.append(",".join(parts))
+            processed_top_events = _split_top_subs_at_primary_boundaries(
+                events1, style_map1
+            )
 
-                        # Preserve any unmapped styles that aren't being replaced
-                        if (
-                            original_style not in style_map1
-                            and original_style not in final_styles
-                        ):
-                            if original_style in styles1:
-                                final_styles[original_style] = styles1[original_style]
-                    except IndexError:
-                        final_events.append(line)  # Append malformed lines as-is
-                else:
+            for line in processed_top_events:
+                try:
+                    parts = line.split(",", 9)
+                    original_style = parts[3].strip()
+                    parts[3] = style_map1.get(
+                        original_style, original_style
+                    )  # Remap or keep original
+                    parts[9] = tag_stripper.sub("", parts[9])
+                    final_events.append(",".join(parts))
+                    if (
+                        original_style not in style_map1
+                        and original_style not in final_styles
+                        and original_style in styles1
+                    ):
+                        final_styles[original_style] = styles1[
+                            original_style
+                        ]  # Preserve unmapped styles
+                except IndexError:
                     final_events.append(line)
 
-            # ### MODIFIED SECTION ###
-            # Process Bottom Subtitles using style-based separation
+            # ### UNCHANGED BOTTOM SUBTITLE PROCESSING ###
+            secondary_intervals = []
             for line in events2:
-                # This check now handles both Dialogue and Comment lines correctly.
+                if line.lower().startswith(("dialogue:", "comment:")):
+                    try:
+                        parts = line.split(",", 9)
+                        if parts[9].strip().startswith("{\\an8}"):
+                            secondary_intervals.append(
+                                (
+                                    _ass_time_to_ms(parts[1].strip()),
+                                    _ass_time_to_ms(parts[2].strip()),
+                                )
+                            )
+                    except Exception:
+                        pass
+
+            for line in events2:
                 if line.lower().startswith(("dialogue:", "comment:")):
                     try:
                         parts = line.split(",", 9)
                         original_style = parts[3].strip()
-
-                        # Check if the style is the one designated for processing
+                        text_field = parts[9]
                         if original_style == "Sub-CN":
-                            # Process this line: remap style and strip tags
-                            text_field = parts[9]
+                            start_ms = _ass_time_to_ms(parts[1].strip())
+                            end_ms = _ass_time_to_ms(parts[2].strip())
                             if text_field.strip().startswith("{\\an8}"):
                                 parts[3] = "Bottom-Secondary"
+                                parts[9] = tag_stripper.sub("", text_field)
+                                final_events.append(",".join(parts))
                             else:
-                                parts[3] = "Bottom-Primary"
-
-                            parts[9] = tag_stripper.sub("", text_field)
-                            final_events.append(",".join(parts))
+                                raise_it = any(
+                                    _overlaps(start_ms, end_ms, s, e)
+                                    for (s, e) in secondary_intervals
+                                )
+                                parts[3] = (
+                                    "Bottom-Primary-Raised"
+                                    if raise_it
+                                    else "Bottom-Primary-Normal"
+                                )
+                                parts[9] = tag_stripper.sub("", text_field)
+                                final_events.append(",".join(parts))
                         else:
-                            # This is the "remainder". Merge it directly.
-                            # 1. Append the line without any modification.
                             final_events.append(line)
-                            # 2. Ensure its original style definition is carried over if not already present.
                             if (
                                 original_style not in final_styles
                                 and original_style in styles2
                             ):
                                 final_styles[original_style] = styles2[original_style]
                     except IndexError:
-                        # Append malformed lines as-is to preserve them
                         final_events.append(line)
                 else:
-                    # Append non-event lines as-is (though _parse_ass_file should filter these out)
                     final_events.append(line)
-            # ### END MODIFIED SECTION ###
 
             # --- 4. ASSEMBLE CLEAN FILE (UNCHANGED) ---
             clean_header = [
                 "[Script Info]",
-                "; Script generated by Dual Subtitle Burner - Final Method",
+                "; Script generated by Dual Subtitle Burner",
                 "Title: Merged Subtitle",
                 "ScriptType: v4.00+",
                 "WrapStyle: 0",
                 "PlayResX: 1920",
                 "PlayResY: 1080",
-                "Collisions: Normal",
+                "Collisions: Reverse",
             ]
-
             merged_content = clean_header
             merged_content.extend(
                 [
@@ -739,12 +826,10 @@ class SubtitleMergerApp(QWidget):
                 ]
             )
             merged_content.extend(final_events)
-
             out_path = self.settings_dir / f"{video_file.stem}_temp_merged.ass"
             out_path.write_text("\n".join(merged_content), encoding="utf-8-sig")
-
             logging.info(
-                f"Successfully performed final style-unification and stacking merge for {video_file.name}."
+                f"Successfully performed split-based merge for {video_file.name}."
             )
             return out_path
         except Exception as e:
