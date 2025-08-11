@@ -710,11 +710,12 @@ class SubtitleMergerApp(QWidget):
 
             # --- 2. CREATE MASTER STYLES ---
             final_styles = {
-                "Top-Primary": "Style: Top-Primary,Roboto,56,&H00FFFFFF,&H000000FF,&H00000000,&H99000000,-1,0,0,0,100,100,0,0,1,2.5,2,8,20,20,20,1",
-                "Top-Secondary": "Style: Top-Secondary,Roboto,48,&H00FFFFFF,&H000000FF,&H00000000,&H99000000,-1,-1,0,0,100,100,0,0,1,2.5,2,8,20,20,20,1",
-                "Bottom-Primary-Normal": "Style: Bottom-Primary-Normal,Noto Sans CJK TC,62,&H00FFFFFF,&H000000FF,&H00000000,&H99000000,-1,0,0,0,100,100,0,0,1,2.5,2,2,20,20,30,1",
-                "Bottom-Primary-Raised": "Style: Bottom-Primary-Raised,Noto Sans CJK TC,62,&H00FFFFFF,&H000000FF,&H00000000,&H99000000,-1,0,0,0,100,100,0,0,1,2.5,2,2,20,20,90,1",
-                "Bottom-Secondary": "Style: Bottom-Secondary,Noto Sans CJK TC,54,&H00FFFFFF,&H000000FF,&H00000000,&H99000000,-1,-1,0,0,100,100,0,0,1,2.5,2,2,20,20,30,1",
+                "Top-Primary": "Style: Top-Primary,Roboto,56,&H00FFFFFF,&H000000FF,&H00000000,&H99000000,-1,0,0,0,100,100,0,0,1,2.5,2,8,20,20,25,1",
+                "Top-Secondary": "Style: Top-Secondary,Roboto,48,&H00FFFFFF,&H000000FF,&H00000000,&H99000000,-1,-1,0,0,100,100,0,0,1,2.5,2,8,20,20,25,1",
+                # Fansub font/outline, but keep your sizes & margins
+                "Bottom-Primary-Normal": "Style: Bottom-Primary-Normal,OGOA6OWA,62,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2.5,0,2,20,20,35,1",
+                "Bottom-Primary-Raised": "Style: Bottom-Primary-Raised,OGOA6OWA,62,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2.5,0,2,20,20,90,1",
+                "Bottom-Secondary": "Style: Bottom-Secondary,OGOA6OWA,54,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,-1,0,0,100,100,0,0,1,2.5,0,2,20,20,30,1",
             }
 
             # --- 3. PROCESS AND REMAP EVENTS ---
@@ -735,6 +736,7 @@ class SubtitleMergerApp(QWidget):
                         original_style, original_style
                     )  # Remap or keep original
                     parts[9] = tag_stripper.sub("", parts[9])
+
                     final_events.append(",".join(parts))
                     if (
                         original_style not in style_map1
@@ -747,52 +749,105 @@ class SubtitleMergerApp(QWidget):
                 except IndexError:
                     final_events.append(line)
 
-            # ### UNCHANGED BOTTOM SUBTITLE PROCESSING ###
+            # --- helpers / config ---
+            passthrough_styles = {
+                "title",
+                "screen",
+                "opjp",
+                "opcn",
+                "staff",
+                "credit",
+                "sign",
+                "sfx",
+            }
+
+            def has_explicit_positioning(s: str) -> bool:
+                return bool(
+                    re.search(r"\{\\(?:pos|move|org)\b.*?\}", s, flags=re.IGNORECASE)
+                )
+
+            def is_karaoke_or_template(effect: str, text: str) -> bool:
+                # effect field non-empty OR \k timing / aegisub templates in text
+                return (
+                    bool(effect.strip())
+                    or bool(re.search(r"\{\\k\d", text))
+                    or ("template" in text.lower())
+                )
+
+            processable_styles = {
+                "sub-cn",
+                "default",
+                "top",
+            }  # only these get transformed
+
+            # --- first pass: collect secondary intervals (Top or \an8) ---
             secondary_intervals = []
             for line in events2:
                 if line.lower().startswith(("dialogue:", "comment:")):
                     try:
                         parts = line.split(",", 9)
-                        if parts[9].strip().startswith("{\\an8}"):
-                            secondary_intervals.append(
-                                (
-                                    _ass_time_to_ms(parts[1].strip()),
-                                    _ass_time_to_ms(parts[2].strip()),
-                                )
-                            )
+                        start_ms = _ass_time_to_ms(parts[1].strip())
+                        end_ms = _ass_time_to_ms(parts[2].strip())
+                        original_style = parts[3].strip()
+                        text_field = parts[9]
+                        if (
+                            text_field.strip().startswith("{\\an8}")
+                            or original_style.casefold() == "top"
+                        ):
+                            secondary_intervals.append((start_ms, end_ms))
                     except Exception:
                         pass
 
+            # --- second pass: process / passthrough ---
             for line in events2:
                 if line.lower().startswith(("dialogue:", "comment:")):
                     try:
                         parts = line.split(",", 9)
                         original_style = parts[3].strip()
+                        effect_field = parts[8]  # Effect column
                         text_field = parts[9]
-                        if original_style == "Sub-CN":
+
+                        # PASSTHROUGH cases: keep exactly as-is
+                        if (
+                            original_style.casefold() in passthrough_styles
+                            or has_explicit_positioning(text_field)
+                            or is_karaoke_or_template(effect_field, text_field)
+                            or original_style.casefold() not in processable_styles
+                        ):
+                            final_events.append(line)
+                            if (original_style not in final_styles) and (
+                                original_style in styles2
+                            ):
+                                final_styles[original_style] = styles2[original_style]
+                            continue
+
+                        # Secondary (small, italic) if {\an8} or style == Top
+                        if (
+                            text_field.strip().startswith("{\\an8}")
+                            or original_style.casefold() == "top"
+                        ):
+                            parts[3] = "Bottom-Secondary"
+                            parts[9] = tag_stripper.sub("", text_field)
+                            final_events.append(",".join(parts))
+                            if ("Top" not in final_styles) and ("Top" in styles2):
+                                final_styles["Top"] = styles2["Top"]
+                        else:
+                            # Primary bottom (Default/Sub-CN): raised on overlap
                             start_ms = _ass_time_to_ms(parts[1].strip())
                             end_ms = _ass_time_to_ms(parts[2].strip())
-                            if text_field.strip().startswith("{\\an8}"):
-                                parts[3] = "Bottom-Secondary"
-                                parts[9] = tag_stripper.sub("", text_field)
-                                final_events.append(",".join(parts))
-                            else:
-                                raise_it = any(
-                                    _overlaps(start_ms, end_ms, s, e)
-                                    for (s, e) in secondary_intervals
-                                )
-                                parts[3] = (
-                                    "Bottom-Primary-Raised"
-                                    if raise_it
-                                    else "Bottom-Primary-Normal"
-                                )
-                                parts[9] = tag_stripper.sub("", text_field)
-                                final_events.append(",".join(parts))
-                        else:
-                            final_events.append(line)
-                            if (
-                                original_style not in final_styles
-                                and original_style in styles2
+                            raise_it = any(
+                                _overlaps(start_ms, end_ms, s, e)
+                                for (s, e) in secondary_intervals
+                            )
+                            parts[3] = (
+                                "Bottom-Primary-Raised"
+                                if raise_it
+                                else "Bottom-Primary-Normal"
+                            )
+                            parts[9] = tag_stripper.sub("", text_field)
+                            final_events.append(",".join(parts))
+                            if (original_style not in final_styles) and (
+                                original_style in styles2
                             ):
                                 final_styles[original_style] = styles2[original_style]
                     except IndexError:
