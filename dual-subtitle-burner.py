@@ -5,7 +5,7 @@ import json
 import re
 import logging
 from pathlib import Path
-from collections import Counter
+from collections import Counter, defaultdict
 from collections import namedtuple
 
 try:
@@ -162,6 +162,92 @@ class SubMerger:
         )
 
     @staticmethod
+    def _has_explicit_positioning(s: str) -> bool:
+        return bool(
+            re.search(r"\{\\(?:pos|move|org|an\d)\b.*?\}", s, flags=re.IGNORECASE)
+        )
+
+    @staticmethod
+    def _is_top_aligned(text: str) -> bool:
+        pos = re.search(r"\\pos\(([^)]+)\)", text)
+        if pos:
+            parts = [p.strip() for p in pos.group(1).split(",")]
+            if len(parts) >= 2:
+                try:
+                    return float(parts[1]) < 540
+                except ValueError:
+                    pass
+        move = re.search(r"\\move\(([^)]+)\)", text)
+        if move:
+            parts = [p.strip() for p in move.group(1).split(",")]
+            if len(parts) >= 4:
+                try:
+                    y1, y2 = float(parts[1]), float(parts[3])
+                    return y1 < 540 and y2 < 540
+                except ValueError:
+                    pass
+        an = re.search(r"\\an(\d)", text)
+        if an:
+            n = int(an.group(1))
+            return n >= 7 or (4 <= n <= 6)
+        return False
+
+    @staticmethod
+    def _force_vertical_region(text: str, to_top: bool) -> str:
+        def fix_an(match):
+            n = int(match.group(1))
+            if to_top:
+                if n <= 3:
+                    n += 6
+                elif n <= 6:
+                    n += 3
+            else:
+                if n >= 7:
+                    n -= 6
+                elif n >= 4:
+                    n -= 3
+            return f"\\an{n}"
+
+        def fix_pos(match):
+            parts = [p.strip() for p in match.group(1).split(",")]
+            x, y = map(float, parts[:2])
+            if to_top and y > 540:
+                y -= 540
+            elif not to_top and y < 540:
+                y += 540
+            return f"\\pos({x:g},{y:g})"
+
+        def fix_move(match):
+            parts = [p.strip() for p in match.group(1).split(",")]
+            x1, y1, x2, y2 = map(float, parts[:4])
+            if to_top:
+                if y1 > 540:
+                    y1 -= 540
+                if y2 > 540:
+                    y2 -= 540
+            else:
+                if y1 < 540:
+                    y1 += 540
+                if y2 < 540:
+                    y2 += 540
+            rest = parts[4:]
+            coords = [f"{x1:g}", f"{y1:g}", f"{x2:g}", f"{y2:g}", *rest]
+            return "\\move(" + ",".join(coords) + ")"
+
+        text = re.sub(r"\\an(\d)", fix_an, text)
+        text = re.sub(r"\\pos\(([^)]+)\)", fix_pos, text)
+        text = re.sub(r"\\move\(([^)]+)\)", fix_move, text)
+        return text
+
+    @staticmethod
+    def _ensure_top_position(text: str) -> str:
+        return SubMerger._force_vertical_region(text, True)
+
+    @staticmethod
+    def _ensure_bottom_position(text: str) -> str:
+        return SubMerger._force_vertical_region(text, False)
+
+    @staticmethod
     def _collect_change_points(events, style_filter):
         points = set()
         for line in events:
@@ -212,9 +298,7 @@ class SubMerger:
         secondary_points = SubMerger._collect_change_points(ev1, is_secondary)
         ev2 = SubMerger._split_events_on_points(ev1, secondary_points, is_primary)
 
-        tag_stripper = re.compile(
-            r"\{\\[^\}]*?(?:an|pos|move|org)[^\}]*\}", re.IGNORECASE
-        )
+        org_stripper = re.compile(r"\{\\[^\}]*?org[^\}]*\}", re.IGNORECASE)
         buckets = defaultdict(list)
         order = []
         for line in ev2:
@@ -238,6 +322,9 @@ class SubMerger:
             primaries, secondaries, others = [], [], []
             for p in buckets[key]:
                 st = p[3].strip()
+                if SubMerger._has_explicit_positioning(p[9]):
+                    others.append(p)
+                    continue
                 mapped = style_map.get(st)
                 if mapped == "Top-Primary":
                     primaries.append(p)
@@ -260,10 +347,17 @@ class SubMerger:
 
             for p in keep + others:
                 st = p[3].strip()
-                mapped = style_map.get(st, st)
-                p[3] = mapped
-                p[9] = tag_stripper.sub("", p[9])
-                normalized.append(",".join(p))
+                if SubMerger._has_explicit_positioning(p[9]):
+                    if not SubMerger._is_top_aligned(p[9]):
+                        p[9] = org_stripper.sub("", SubMerger._ensure_top_position(p[9]))
+                    else:
+                        p[9] = org_stripper.sub("", p[9])
+                    normalized.append(",".join(p))
+                else:
+                    mapped = style_map.get(st, st)
+                    p[3] = mapped
+                    p[9] = org_stripper.sub("", SubMerger._ensure_top_position(p[9]))
+                    normalized.append(",".join(p))
         return normalized
 
     # ----------------------------- Bottom (Chinese) pipeline -----------------------------
@@ -281,11 +375,6 @@ class SubMerger:
             "sign",
             "sfx",
         }
-
-        def has_explicit_positioning(s: str) -> bool:
-            return bool(
-                re.search(r"\{\\(?:pos|move|org|an\d)\b.*?\}", s, flags=re.IGNORECASE)
-            )
 
         def is_karaoke_or_template(effect: str, text: str) -> bool:
             return (
@@ -315,19 +404,31 @@ class SubMerger:
             effect = p[8]
             text = p[9]
 
+            has_pos = SubMerger._has_explicit_positioning(text)
+            s_ms = SubMerger._ass_time_to_ms(p[1].strip())
+            e_ms = SubMerger._ass_time_to_ms(p[2].strip())
+
             if (
                 st.casefold() in passthrough_styles
-                or has_explicit_positioning(text)
                 or is_karaoke_or_template(effect, text)
                 or st.casefold() not in processable
             ):
-                final_events.append(line)
+                if has_pos and SubMerger._is_top_aligned(text) and collides_with_top(s_ms, e_ms):
+                    p[9] = SubMerger._ensure_bottom_position(text)
+                    final_events.append(",".join(p))
+                else:
+                    final_events.append(line)
                 if st in styles2:
                     kept_styles.add(st)
                 continue
 
-            s_ms = SubMerger._ass_time_to_ms(p[1].strip())
-            e_ms = SubMerger._ass_time_to_ms(p[2].strip())
+            if has_pos:
+                if SubMerger._is_top_aligned(text) and collides_with_top(s_ms, e_ms):
+                    p[9] = SubMerger._ensure_bottom_position(text)
+                final_events.append(",".join(p))
+                if st in styles2:
+                    kept_styles.add(st)
+                continue
 
             text_clean = tag_stripper.sub("", text)
             is_top_like = text.strip().startswith("{\\an8}") or st.casefold() == "top"
@@ -367,7 +468,13 @@ class SubMerger:
                 if not ok:
                     continue
                 if p[0].lower().startswith("dialogue:"):
-                    if p[3].strip() in ("Top-Primary", "Top-Secondary"):
+                    st = p[3].strip()
+                    text = p[9]
+                    has_pos = self._has_explicit_positioning(text)
+                    if (
+                        st in ("Top-Primary", "Top-Secondary")
+                        or (has_pos and self._is_top_aligned(text))
+                    ):
                         s = self._ass_time_to_ms(p[1].strip())
                         e = self._ass_time_to_ms(p[2].strip())
                         english_intervals.append((s, e))
