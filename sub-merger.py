@@ -323,6 +323,8 @@ class SubMerger:
             text = p[9]
 
             has_pos = SubMerger._has_explicit_positioning(text)
+            s_ms = SubMerger._ass_time_to_ms(p[1].strip())
+            e_ms = SubMerger._ass_time_to_ms(p[2].strip())
             if (
                 st.casefold() in passthrough_styles
                 or is_karaoke_or_template(effect, text)
@@ -343,9 +345,6 @@ class SubMerger:
                 if st in styles2:
                     kept_styles.add(st)
                 continue
-
-            s_ms = SubMerger._ass_time_to_ms(p[1].strip())
-            e_ms = SubMerger._ass_time_to_ms(p[2].strip())
 
             text_clean = tag_stripper.sub("", text)
             is_top_like = text.strip().startswith("{\\an8}") or st.casefold() == "top"
