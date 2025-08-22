@@ -5,7 +5,7 @@ import json
 import re
 import logging
 from pathlib import Path
-from collections import Counter
+from collections import Counter, defaultdict
 from collections import namedtuple
 
 try:
