@@ -168,6 +168,42 @@ class SubMerger:
         )
 
     @staticmethod
+    def _has_absolute_position(s: str) -> bool:
+        return bool(
+            re.search(r"\{\\(?:pos|move|org)\b.*?\}", s, flags=re.IGNORECASE)
+        )
+
+    @staticmethod
+    def _is_top_region(text: str) -> bool:
+        an = re.search(r"\\an(\d)", text)
+        if an:
+            try:
+                n = int(an.group(1))
+                if n >= 7:
+                    return True
+            except ValueError:
+                pass
+        pos = re.search(r"\\pos\(([^)]+)\)", text)
+        if pos:
+            parts = [p.strip() for p in pos.group(1).split(",")]
+            if len(parts) >= 2:
+                try:
+                    y = float(parts[1])
+                    return y < 540
+                except ValueError:
+                    pass
+        move = re.search(r"\\move\(([^)]+)\)", text)
+        if move:
+            parts = [p.strip() for p in move.group(1).split(",")]
+            if len(parts) >= 4:
+                try:
+                    y1, y2 = float(parts[1]), float(parts[3])
+                    return y1 < 540 and y2 < 540
+                except ValueError:
+                    pass
+        return False
+
+    @staticmethod
     def _force_vertical_region(text: str, to_top: bool) -> str:
         def fix_an(match):
             n = int(match.group(1))
@@ -185,16 +221,16 @@ class SubMerger:
 
         def fix_pos(match):
             parts = [p.strip() for p in match.group(1).split(",")]
-            x, y = map(int, parts[:2])
+            x, y = map(float, parts[:2])
             if to_top and y > 540:
                 y -= 540
             elif not to_top and y < 540:
                 y += 540
-            return f"\\pos({x},{y})"
+            return f"\\pos({x:g},{y:g})"
 
         def fix_move(match):
             parts = [p.strip() for p in match.group(1).split(",")]
-            x1, y1, x2, y2 = map(int, parts[:4])
+            x1, y1, x2, y2 = map(float, parts[:4])
             if to_top:
                 if y1 > 540:
                     y1 -= 540
@@ -206,7 +242,7 @@ class SubMerger:
                 if y2 < 540:
                     y2 += 540
             rest = parts[4:]
-            coords = [str(x1), str(y1), str(x2), str(y2), *rest]
+            coords = [f"{x1:g}", f"{y1:g}", f"{x2:g}", f"{y2:g}", *rest]
             return "\\move(" + ",".join(coords) + ")"
 
         text = re.sub(r"\\an(\d)", fix_an, text)
@@ -221,6 +257,47 @@ class SubMerger:
     @staticmethod
     def _ensure_bottom_position(text: str) -> str:
         return SubMerger._force_vertical_region(text, False)
+
+    @staticmethod
+    def _ensure_middle_position(text: str) -> str:
+        def fix_an(match):
+            n = int(match.group(1))
+            if n >= 7:
+                n -= 3
+            elif n <= 3:
+                n += 3
+            return f"\\an{n}"
+
+        def adjust_y(y: float) -> float:
+            if y < 540:
+                y = max(560.0, min(720.0, y + 200.0))
+            return y
+
+        def fix_pos(match):
+            parts = [p.strip() for p in match.group(1).split(",")]
+            try:
+                x = float(parts[0])
+                y = adjust_y(float(parts[1]))
+                parts[0], parts[1] = f"{x:g}", f"{y:g}"
+                return "\\pos(" + ",".join(parts) + ")"
+            except Exception:
+                return match.group(0)
+
+        def fix_move(match):
+            parts = [p.strip() for p in match.group(1).split(",")]
+            try:
+                x1, y1, x2, y2 = map(float, parts[:4])
+                y1 = adjust_y(y1)
+                y2 = adjust_y(y2)
+                parts[:4] = [f"{x1:g}", f"{y1:g}", f"{x2:g}", f"{y2:g}"]
+                return "\\move(" + ",".join(parts) + ")"
+            except Exception:
+                return match.group(0)
+
+        text = re.sub(r"\\an(\d)", fix_an, text)
+        text = re.sub(r"\\pos\(([^)]+)\)", fix_pos, text)
+        text = re.sub(r"\\move\(([^)]+)\)", fix_move, text)
+        return text
 
     @staticmethod
     def _collect_change_points(events, style_filter):
@@ -377,25 +454,39 @@ class SubMerger:
             text = p[9]
 
             has_pos = SubMerger._has_explicit_positioning(text)
+            has_coords = SubMerger._has_absolute_position(text)
             s_ms = SubMerger._ass_time_to_ms(p[1].strip())
             e_ms = SubMerger._ass_time_to_ms(p[2].strip())
-            if (
-                st.casefold() in passthrough_styles
-                or is_karaoke_or_template(effect, text)
-                or st.casefold() not in processable
-            ):
-                if has_pos:
-                    p[9] = SubMerger._ensure_bottom_position(text)
-                    final_events.append(",".join(p))
-                else:
+            if st.casefold() in passthrough_styles:
+                if has_coords:
                     final_events.append(line)
+                else:
+                    if SubMerger._is_top_region(text):
+                        p[9] = SubMerger._ensure_middle_position(text)
+                        if p[0].lower().startswith("dialogue:"):
+                            p[0] = "Dialogue: 0"
+                        final_events.append(",".join(p))
+                    else:
+                        final_events.append(line)
+                if st in styles2:
+                    kept_styles.add(st)
+                continue
+
+            if is_karaoke_or_template(effect, text) or st.casefold() not in processable:
+                final_events.append(line)
                 if st in styles2:
                     kept_styles.add(st)
                 continue
 
             if has_pos:
-                p[9] = SubMerger._ensure_bottom_position(text)
-                final_events.append(",".join(p))
+                if has_coords and SubMerger._is_top_region(text):
+                    p[9] = SubMerger._ensure_middle_position(text)
+                    p[3] = "Bottom-Secondary"
+                    if p[0].lower().startswith("dialogue:"):
+                        p[0] = "Dialogue: 0"
+                    final_events.append(",".join(p))
+                else:
+                    final_events.append(line)
                 if st in styles2:
                     kept_styles.add(st)
                 continue
