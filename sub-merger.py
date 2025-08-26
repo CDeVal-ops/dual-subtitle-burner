@@ -525,8 +525,10 @@ class SubMerger:
             
             # Extract font size from English (top) subtitles and calculate scaling
             source_font_size = self._extract_font_size_from_styles(styles1)
-            top_primary_size = self._calculate_font_scale(res1_x, res1_y, source_font_size)
-            top_secondary_size = max(int(top_primary_size * 0.95), 36)  # Secondary only slightly smaller
+            calculated_size = self._calculate_font_scale(res1_x, res1_y, source_font_size)
+            # Set primary to current secondary size (62px) and secondary to 80% of primary
+            top_primary_size = 62
+            top_secondary_size = max(int(top_primary_size * 0.8), 36)  # Secondary 20% smaller than primary
             
             logging.info(f"English subtitle scaling: {res1_x}x{res1_y} @ {source_font_size}px -> 1920x1080 @ {top_primary_size}px")
 
