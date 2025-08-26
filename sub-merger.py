@@ -1,10 +1,12 @@
 import logging
 import re
+from pathlib import Path
 from collections import Counter, defaultdict
 
 
 class SubMerger:
-    # Keep your existing __init__ that defines self.settings_dir
+    def __init__(self, settings_dir=None):
+        self.settings_dir = settings_dir or Path.cwd()
 
     # ----------------------------- Parsing & Time -----------------------------
     @staticmethod
@@ -28,6 +30,7 @@ class SubMerger:
     @staticmethod
     def _parse_ass_file(sub_lines):
         styles, events = {}, []
+        play_res_x, play_res_y = 1920, 1080  # defaults
         current_section = None
         for raw in sub_lines:
             line = raw.rstrip("\n")
@@ -38,6 +41,16 @@ class SubMerger:
                 current_section = "events"
             elif line.strip().startswith("["):
                 current_section = None
+            elif low.startswith("playresx:"):
+                try:
+                    play_res_x = int(line.split(":", 1)[1].strip())
+                except (ValueError, IndexError):
+                    pass
+            elif low.startswith("playresy:"):
+                try:
+                    play_res_y = int(line.split(":", 1)[1].strip())
+                except (ValueError, IndexError):
+                    pass
 
             if current_section == "styles" and line.lower().startswith("style:"):
                 try:
@@ -50,14 +63,53 @@ class SubMerger:
                 or line.lower().startswith("comment:")
             ):
                 events.append(line)
-        return styles, events
+        return styles, events, play_res_x, play_res_y
 
     # ----------------------------- Styles -----------------------------
     @staticmethod
-    def _build_master_styles():
+    def _extract_font_size_from_styles(styles):
+        """Extract font size from the most commonly used style (likely Default)"""
+        for style_name in ["Default", "default"]:
+            if style_name in styles:
+                try:
+                    parts = styles[style_name].split(",")
+                    if len(parts) >= 3:
+                        return int(parts[2])  # Fontsize is the 3rd field
+                except (ValueError, IndexError):
+                    continue
+        
+        # Fallback: try to extract from any available style
+        for style_line in styles.values():
+            try:
+                parts = style_line.split(",")
+                if len(parts) >= 3:
+                    return int(parts[2])
+            except (ValueError, IndexError):
+                continue
+        
+        return 22  # Default fallback
+
+    @staticmethod
+    def _calculate_font_scale(source_res_x, source_res_y, source_font_size, target_res_x=1920, target_res_y=1080):
+        """Calculate appropriate font scaling based on resolution differences"""
+        # Calculate scaling factors for both dimensions
+        scale_x = target_res_x / source_res_x
+        scale_y = target_res_y / source_res_y
+        
+        # Use the smaller scale to prevent oversized fonts, but ensure minimum readability
+        scale_factor = min(scale_x, scale_y)
+        
+        # Apply scaling to the source font size
+        scaled_font = int(source_font_size * scale_factor)
+        
+        # Ensure reasonable bounds (minimum 24px, maximum 120px)
+        return max(24, min(120, scaled_font))
+
+    @staticmethod
+    def _build_master_styles(top_primary_size=56, top_secondary_size=48):
         return {
-            "Top-Primary": "Style: Top-Primary,Roboto,56,&H00FFFFFF,&H000000FF,&H00000000,&H99000000,-1,0,0,0,100,100,0,0,1,2.5,2,8,20,20,25,1",
-            "Top-Secondary": "Style: Top-Secondary,Roboto,48,&H00FFFFFF,&H000000FF,&H00000000,&H99000000,-1,-1,0,0,100,100,0,0,1,2.5,2,8,20,20,25,1",
+            "Top-Primary": f"Style: Top-Primary,Roboto,{top_primary_size},&H00FFFFFF,&H000000FF,&H00000000,&H99000000,-1,0,0,0,100,100,0,0,1,2.5,2,8,20,20,25,1",
+            "Top-Secondary": f"Style: Top-Secondary,Roboto,{top_secondary_size},&H00FFFFFF,&H000000FF,&H00000000,&H99000000,-1,-1,0,0,100,100,0,0,1,2.5,2,8,20,20,25,1",
             "Bottom-Primary-Normal": "Style: Bottom-Primary-Normal,OGOA6OWA,62,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2.5,0,2,20,20,35,1",
             "Bottom-Primary-Raised": "Style: Bottom-Primary-Raised,OGOA6OWA,62,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2.5,0,2,20,20,90,1",
             "Bottom-Secondary": "Style: Bottom-Secondary,OGOA6OWA,54,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,-1,0,0,100,100,0,0,1,2.5,0,2,20,20,30,1",
@@ -347,6 +399,8 @@ class SubMerger:
             for p in keep + others:
                 st = p[3].strip()
                 if SubMerger._has_explicit_positioning(p[9]):
+                    # Positioned dialogue should be mapped to Top-Secondary
+                    p[3] = "Top-Secondary"
                     p[9] = org_stripper.sub("", SubMerger._ensure_top_position(p[9]))
                     normalized.append(",".join(p))
                 else:
@@ -466,10 +520,17 @@ class SubMerger:
             sub2_text = second_sub.read_text(
                 encoding="utf-8", errors="ignore"
             ).splitlines()
-            styles1, events1 = self._parse_ass_file(sub1_text)
-            styles2, events2 = self._parse_ass_file(sub2_text)
+            styles1, events1, res1_x, res1_y = self._parse_ass_file(sub1_text)
+            styles2, events2, res2_x, res2_y = self._parse_ass_file(sub2_text)
+            
+            # Extract font size from English (top) subtitles and calculate scaling
+            source_font_size = self._extract_font_size_from_styles(styles1)
+            top_primary_size = self._calculate_font_scale(res1_x, res1_y, source_font_size)
+            top_secondary_size = max(int(top_primary_size * 0.95), 36)  # Secondary only slightly smaller
+            
+            logging.info(f"English subtitle scaling: {res1_x}x{res1_y} @ {source_font_size}px -> 1920x1080 @ {top_primary_size}px")
 
-            final_styles = self._build_master_styles()
+            final_styles = self._build_master_styles(top_primary_size, top_secondary_size)
 
             style_map1 = self._create_top_style_map(styles1, events1)
             top_events = self._normalize_top(events1, style_map1)
