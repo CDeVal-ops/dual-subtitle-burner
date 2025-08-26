@@ -163,6 +163,11 @@ class SubMerger:
         return bool(
             re.search(r"\{\\(?:pos|move|org|an\d)\b.*?\}", s, flags=re.IGNORECASE)
         )
+    
+    @staticmethod
+    def _has_an8_positioning(s: str) -> bool:
+        """Check if text contains \\an8 (top center) positioning tag"""
+        return bool(re.search(r"\{\\an8\b.*?\}", s, flags=re.IGNORECASE))
 
     @staticmethod
     def _has_absolute_position(s: str) -> bool:
@@ -399,8 +404,13 @@ class SubMerger:
             for p in keep + others:
                 st = p[3].strip()
                 if SubMerger._has_explicit_positioning(p[9]):
-                    # Positioned dialogue should be mapped to Top-Secondary
-                    p[3] = "Top-Secondary"
+                    # Check if this is \\an8 positioned dialogue and if there are no regular primaries
+                    if SubMerger._has_an8_positioning(p[9]) and not primaries:
+                        # Promote \\an8 to Top-Primary when no regular primaries exist
+                        p[3] = "Top-Primary"
+                    else:
+                        # Other positioned dialogue should be mapped to Top-Secondary
+                        p[3] = "Top-Secondary"
                     p[9] = org_stripper.sub("", SubMerger._ensure_top_position(p[9]))
                     normalized.append(",".join(p))
                 else:
